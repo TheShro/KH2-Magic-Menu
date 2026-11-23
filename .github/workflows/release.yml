@@ -1,0 +1,39 @@
+name: release
+# Push a tag like v1.8 to build ShroMagicMenu.dll on a clean machine and publish a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build ShroMagicMenu.dll (x64)
+        shell: cmd
+        run: |
+          mkdir build
+          cl /nologo /LD /O2 /MT /W4 /D_CRT_SECURE_NO_WARNINGS src\shro_magic_menu.c /Fobuild\ /Febuild\ShroMagicMenu.dll /link /DLL kernel32.lib || exit /b 1
+          dumpbin /headers build\ShroMagicMenu.dll | findstr /c:"8664 machine (x64)" || (echo NOT x64 & exit /b 1)
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "ShroMagicMenu-${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force "pkg/ShroMagicMenu" | Out-Null
+          Copy-Item mod/mod.yml, build/ShroMagicMenu.dll "pkg/ShroMagicMenu/"
+          Copy-Item README.md, LICENSE pkg/
+          Compress-Archive -Path pkg/* -DestinationPath "$name.zip"
+          "ZIP=$name.zip" >> $env:GITHUB_ENV
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ${{ env.ZIP }}
+          body: |
+            Shro's Magic Menu ${{ github.ref_name }}, built by GitHub Actions from this tag.
+            Install: copy the `ShroMagicMenu` folder into `openkh\mods\kh2\` and rebuild in Mods Manager.
+            Steam Global only. Settings: `ShroMagicMenu.ini` next to the game exe (written on first run).
