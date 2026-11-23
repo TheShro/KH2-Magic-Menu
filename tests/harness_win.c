@@ -44,6 +44,20 @@ static int map_exe(const char *path)
     return 1;
 }
 
+/* Stand-ins for the game's object entry / model path / model cache lookups: two loaded objects. */
+static int g_loaded_a = 0, g_loaded_b = 0;
+static char g_path_buf[32];
+static void *SMM_GAME_ABI test_entry(int id) { static int e; e = id & 0x0FFFFFFF; return &e; }
+static char *SMM_GAME_ABI test_path(void *entry, char *buf) { (void)buf; _snprintf_s(g_path_buf, sizeof(g_path_buf), _TRUNCATE, "obj/%X.mdlx", *(int *)entry); return g_path_buf; }
+static void *SMM_GAME_ABI test_find(const char *name, int tag)
+{
+    char a[32], b[32];
+    (void)tag;
+    _snprintf_s(a, sizeof(a), _TRUNCATE, "obj/%X.mdlx", g_loaded_a);
+    _snprintf_s(b, sizeof(b), _TRUNCATE, "obj/%X.mdlx", g_loaded_b);
+    return (g_loaded_a && !strcmp(name, a)) || (g_loaded_b && !strcmp(name, b)) ? (void *)name : NULL;
+}
+
 static void set_flag(unsigned n, int on)
 {
     DWORD a = 0x9ABC40 + (n >> 5) * 4, v = r32(a);
@@ -96,20 +110,25 @@ int main(int argc, char **argv)
 
     /* --- remote shop with a stand-in OpenShop and a stand-in shop table */
     {
-        static const BYTE stub[7] = { 0x89, 0x0D, 0, 0, 0, 0, 0xC3 };   /* mov [exe+716B50],ecx; ret */
+        /* OpenShop past our entry hook (the cave runs push rbx / sub rsp,20h, then jumps to +6):
+           mov [exe+716B50],ecx; add rsp,20h; pop rbx; ret */
+        static const BYTE stub[12] = { 0x89, 0x0D, 0, 0, 0, 0, 0x48, 0x83, 0xC4, 0x20, 0x5B, 0xC3 };
         BYTE *tab = g_img + 0x2DA0000;
         UINT64 p = (UINT64)(UINT_PTR)tab;
-        INT32 d = (INT32)(0x716B50 - (0x1518E0 + 6));
-        memcpy(g_img + 0x1518E0, stub, 7); memcpy(g_img + 0x1518E2, &d, 4);
+        INT32 d = (INT32)(0x716B50 - (0x1518E6 + 6));
+        check(g_openshop_hook == 0x1518E0 && g_img[0x1518E0] == 0xE9, "OpenShop entry hook written (last moogle tracking)");
+        memcpy(g_img + 0x1518E6, stub, 12); memcpy(g_img + 0x1518E8, &d, 4);
+        g_obj_entry = test_entry; g_obj_path = test_path; g_res_find = test_find;
         memset(tab, 0, 0x100);
         tab[6] = 3;                                                     /* 3 shops */
-        w16(0x2DA0010, 0x13); w16(0x2DA0012, 0x01A0); w16(0x2DA0014, 0x1234); w16(0x2DA0016, 0x05);
-        w16(0x2DA0028, 0x85); w16(0x2DA002A, 0x01A1);
-        w16(0x2DA0040, 0x66); w16(0x2DA0042, 0x01A2);
+        w16(0x2DA0010, 0x13); w16(0x2DA0012, 0x01A0); w16(0x2DA0014, 0x1234); w16(0x2DA0016, 0x50F);
+        w16(0x2DA0028, 0x85); w16(0x2DA002A, 0x01A1); w16(0x2DA002E, 0x487);
+        w16(0x2DA0040, 0x66); w16(0x2DA0042, 0x01A2); w16(0x2DA0046, 0x539);
         w32(0x716B50, 0xFFFFFFFF);
         memcpy(g_img + 0xBEE968, &p, 8);
         g_img[SMM_WORLD] = 0x04; g_img[SMM_BTLTYP] = 0;
         w32(SMM_CUT_FLAGS, 1); w16(SMM_CUT_PAUSE, 0);
+        g_loaded_a = 0x50F; g_loaded_b = SMM_OBJ_PLAYER;               /* the moogle's room */
 
         set_flag(0x1A0, 0);
         g_cfg.shop_id = 0x13; g_cfg.shop_visited_only = 1;
@@ -131,6 +150,41 @@ int main(int argc, char **argv)
         g_img[SMM_WORLD] = 0x04; w32(SMM_CUT_FLAGS, 5);
         check(!smm_do_shop("test"), "cutscene: refused");
         w32(SMM_CUT_FLAGS, 1);
+
+        /* shopkeeper model: loaded -> as is; not loaded -> Sora (0x236) until the shop closes */
+        g_cfg.shop_id = 0x13; w32(0x716B50, 0xFFFFFFFF);
+        check(smm_do_shop("test") && r16(0x2DA0016) == 0x50F && !g_keeper_swapped, "moogle loaded here: shopkeeper kept");
+        w32(0x716B50, 0xFFFFFFFF);
+        g_loaded_a = 0;                                                 /* the next room */
+        check(smm_do_shop("test") && r16(0x2DA0016) == SMM_OBJ_PLAYER && g_keeper_swapped, "moogle not loaded: Sora stands in");
+        smm_on_frame();
+        check(r16(0x2DA0016) == SMM_OBJ_PLAYER, "shop still open: stand-in kept");
+        w32(0x716B50, 0xFFFFFFFF);
+        smm_on_frame();
+        check(r16(0x2DA0016) == 0x50F && !g_keeper_swapped, "shop closed: moogle put back");
+        g_loaded_b = 0;
+        check(!smm_do_shop("test") && r32(0x716B50) == 0xFFFFFFFF && r16(0x2DA0016) == 0x50F, "nothing loaded: refused, table untouched");
+        g_loaded_a = 0x50F; g_loaded_b = SMM_OBJ_PLAYER;
+
+        /* last moogle: the game opening a moogle's shop (through the real hook) is remembered */
+        g_last_shop = -1;
+        ((void (*)(int))(g_img + 0x1518E0))(0x66);
+        check(g_last_shop == -1 && r32(0x716B50) == 0x66, "game opens a non-moogle shop: not remembered");
+        w32(0x716B50, 0xFFFFFFFF);
+        ((void (*)(int))(g_img + 0x1518E0))(0x85);
+        check(g_last_shop == 0x85 && r32(0x716B50) == 0x85, "game opens moogle shop 0x85: remembered");
+        g_last_shop = -1; smm_read_last_shop();
+        check(g_last_shop == 0x85, "remembered moogle read back from ShroMagicMenu-lastshop.txt");
+        w32(0x716B50, 0xFFFFFFFF);
+        g_cfg.shop_id = -1;
+        g_loaded_a = 0x487;
+        check(smm_do_shop("test") && r32(0x716B50) == 0x85 && g_last_shop == 0x85, "ShopId = Last: opens the remembered moogle 0x85");
+        w32(0x716B50, 0xFFFFFFFF);
+        g_last_shop = -1;
+        g_loaded_a = 0x50F;
+        check(smm_do_shop("test") && r32(0x716B50) == 0x13, "ShopId = Last, none remembered: Hollow Bastion 0x13");
+        w32(0x716B50, 0xFFFFFFFF);
+
         p = 0; memcpy(g_img + 0xBEE968, &p, 8);
         check(!smm_do_shop("test"), "shop table not loaded: refused");
     }
@@ -159,9 +213,9 @@ int main(int argc, char **argv)
               "ShopId 85h, L2+Down, VisitedOnly 0 parsed");
         check(g_cfg.save_on && !g_cfg.load_on, "LoadMenu on the SaveMenu keybind: LoadMenu OFF");
         memcpy(g_ini_text, ini2, sizeof(ini2));
-        check(smm_load_settings(0) == 2 && g_cfg.shop_id == 0x13 && !g_cfg.load_on, "bad ShopId keeps 0x13; face button refused");
+        check(smm_load_settings(0) == 2 && g_cfg.shop_id == -1 && !g_cfg.load_on, "bad ShopId keeps Last; face button refused");
         memcpy(g_ini_text, SMM_DEFAULT_INI, sizeof(SMM_DEFAULT_INI));
-        check(smm_load_settings(0) == 0 && g_cfg.load_on && g_cfg.shop_on && g_cfg.shop_id == 0x13, "default settings file parses cleanly");
+        check(smm_load_settings(0) == 0 && g_cfg.load_on && g_cfg.shop_on && g_cfg.shop_id == -1, "default settings file parses cleanly (ShopId = Last)");
     }
 
     /* --- crash report: a fault is logged once and passed on to the next handler */

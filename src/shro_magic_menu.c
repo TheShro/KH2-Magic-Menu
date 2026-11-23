@@ -56,7 +56,7 @@
 #include <stdarg.h>
 #include <string.h>
 
-#define SMM_VERSION "1.9-test2"
+#define SMM_VERSION "1.9-test3"
 
 /* ---------------------------------------------------------------- data addresses (Steam Global) */
 #define SMM_SHOULDERS     0x7133EB   /* controller: L2=01 R2=02 L1=04 R1=08 (+face buttons above) */
@@ -119,7 +119,7 @@ static const SmmConfig SMM_DEFAULTS = {
     1, 0,                              /* log on, verbose off */
     1, { 0x04, SMM_TRIG_START },       /* load menu: L1 + Start */
     1, { 0x01, SMM_TRIG_START },       /* remote shop: L2 + Start */
-    0x13,                              /* shop: the Hollow Bastion moogle */
+    -1,                                /* shop: the last moogle used (Last), else 0x13 */
     1                                  /* only shops the story has already unlocked */
 };
 static SmmConfig g_cfg;
@@ -167,9 +167,12 @@ static const char SMM_DEFAULT_INI[] =
 "; Opens a shop from anywhere outside battle, the same way talking to its shopkeeper does.\r\n"
 "Enabled = 1\r\n"
 "Keybind = L2+Start\r\n"
-"; Which shop (hex like 0x13, or decimal). 0x13 = the Hollow Bastion moogle. The log lists\r\n"
-"; every shop the game knows the first time you use the keybind.\r\n"
-"ShopId = 0x13\r\n"
+"; Which shop: Last = the last moogle you talked to (remembered between sessions; the\r\n"
+"; Hollow Bastion moogle until you have talked to one), or a shop id (hex like 0x13).\r\n"
+"; The log lists every shop the game knows the first time you use the keybind.\r\n"
+"; Away from the shopkeeper, Sora stands in for them in the shop (the game can only show a\r\n"
+"; shopkeeper whose model is loaded where you are).\r\n"
+"ShopId = Last\r\n"
 "; 1 = only shops the story has already unlocked (you have met that shopkeeper).\r\n"
 "VisitedOnly = 1\r\n"
 "\r\n"
@@ -405,7 +408,7 @@ static int smm_load_settings(int quiet)
             } else if (smm_ieq(section, "RemoteShop")) {
                 if (smm_ieq(key, "Enabled")) flag = &g_cfg.shop_on;
                 else if (smm_ieq(key, "Keybind")) bind = &g_cfg.shop_bind;
-                else if (smm_ieq(key, "ShopId")) num = &g_cfg.shop_id;
+                else if (smm_ieq(key, "ShopId")) { if (smm_ieq(val, "Last")) { g_cfg.shop_id = -1; continue; } num = &g_cfg.shop_id; }
                 else if (smm_ieq(key, "VisitedOnly")) flag = &g_cfg.shop_visited_only;
             } else if (smm_ieq(section, "SaveMenu")) {
                 if (smm_ieq(key, "Enabled")) flag = &g_cfg.save_on;
@@ -533,10 +536,19 @@ static SmmTarget g_targets[] = {
       "C7 44 24 30 8C 00 00 00 48 89 4C 24 28 4C 8D 0D ?? ?? ?? ?? 33 D2 C7 44 24 20 00 10 00 00 "
       "48 8B 48 08 41 B8 CE 07 00 00 E8 ?? ?? ?? ?? 48 8B 5C 24 50 48 8B 74 24 58 48 83 C4 40 5F C3",
       0x31D320, 0, 0 },
+    /* RemoteShop only: the shop's 3D shopkeeper setup (exe+3E6120): model path from the object
+       entry, then the model cache. The shop can only show a model that is already loaded. */
+    { "ShopKeeperModel",
+      "40 53 48 83 EC 20 48 8B D9 33 D2 48 8B 49 08 E8 ?? ?? ?? ?? 8B 13 48 8B C8 E8 ?? ?? ?? ?? 8B 4B 04 48 89 43 10 E8",
+      0x3E6120, 0, 0 },
+    /* RemoteShop only: its caller, which looks the object entry up by id. */
+    { "ShopKeeperEntry",
+      "48 85 FF 75 0A 8B CE E8 ?? ?? ?? ?? 48 8B F8 48 8B D7 8B CE E8",
+      0x3E6428, 0, 0 },
 };
 #define SMM_TARGET_COUNT (sizeof(g_targets) / sizeof(g_targets[0]))
 enum { T_OPENMENU = 0, T_STARTCHECK = 1, T_PAUSESELECT = 2, T_PAUSETAIL = 3, T_BUTTONS = 4, T_SAVEMODE = 5,
-       T_OPENSHOP = 6, T_SHOPTABLE = 7, T_PAUSESETUP = 8 };
+       T_OPENSHOP = 6, T_SHOPTABLE = 7, T_PAUSESETUP = 8, T_KEEPERMODEL = 9, T_KEEPERENTRY = 10 };
 
 #define SMM_MAX_SIG 128
 
@@ -852,6 +864,103 @@ static DWORD g_shop_var = 0;           /* the open shop's id, -1 = none (exe+716
 static DWORD g_shop_table = 0;         /* qword: pointer to the loaded shop table (exe+BEE968) */
 static int g_shop_ok = 0, g_shop_listed = 0;
 
+/* The shop shows its shopkeeper as a 3D model (exe+3E63D0 -> 3E6120): object entry by id
+   (exe+3DFEB0), model path "obj/<name>.mdlx" (exe+3E0B50), then the model cache (exe+39E1E0,
+   via exe+39CC40). It cannot load a model: a shopkeeper that is not loaded where the player
+   stands crashes the game (stack overflow, seen in 1.9-test2 from the room next to the
+   moogle). Object id 0x236 is the game's "current player" (Sora's model for this world, via
+   exe+3DFEB0's first special case), which is always loaded. */
+typedef void *(SMM_GAME_ABI *SmmEntryFn)(int);
+typedef char *(SMM_GAME_ABI *SmmPathFn)(void *entry, char *buf);
+typedef void *(SMM_GAME_ABI *SmmFindFn)(const char *name, int tag);
+static SmmEntryFn g_obj_entry = NULL;
+static SmmPathFn g_obj_path = NULL;
+static SmmFindFn g_res_find = NULL;
+#define SMM_KEEPER_FLAG   0x20000000   /* the shop passes shopkeeper | this to the model code */
+#define SMM_OBJ_PLAYER    0x236
+static BYTE *g_keeper_swapped = NULL;  /* shop entry whose shopkeeper we replaced, until the shop closes */
+static WORD g_keeper_orig = 0;
+
+/* 1 = the shop's model code would find this object's model already loaded. */
+static int smm_model_loaded(int obj)
+{
+    void *e;
+    char *path;
+    if (!g_obj_entry) return 0;
+    e = g_obj_entry(obj | SMM_KEEPER_FLAG);
+    if (!e) return 0;
+    path = g_obj_path(e, NULL);
+    return path && g_res_find(path, -1) != NULL;
+}
+
+static void smm_keeper_restore(const char *why)
+{
+    if (!g_keeper_swapped) return;
+    if ((g_keeper_swapped[6] | g_keeper_swapped[7] << 8) == SMM_OBJ_PLAYER) {
+        g_keeper_swapped[6] = (BYTE)g_keeper_orig; g_keeper_swapped[7] = (BYTE)(g_keeper_orig >> 8);
+    }
+    g_keeper_swapped = NULL;
+    smm_logv("Shopkeeper put back (%s)", why);
+}
+
+/* ---- last moogle used: recorded when the game opens a moogle's shop, kept in a small file */
+#define SMM_DEFAULT_SHOP  0x13         /* the Hollow Bastion moogle, until one has been talked to */
+static int g_last_shop = -1;
+static int g_shop_ours = 0;            /* 1 while our keybind is calling OpenShop */
+static DWORD g_openshop_hook = 0;      /* exe+1518E0, 0 = not hooked (no tracking) */
+static void smm_read_last_shop(void)
+{
+    wchar_t path[MAX_PATH];
+    HANDLE h;
+    char buf[64];
+    DWORD got = 0;
+    int v;
+    if (!smm_game_path(path, L"ShroMagicMenu-lastshop.txt")) return;
+    h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    if (ReadFile(h, buf, sizeof(buf) - 1, &got, NULL)) {
+        buf[got] = 0;
+        { char *nl = strpbrk(buf, "\r\n"); if (nl) *nl = 0; }
+        if (smm_parse_num(smm_trim(buf), &v)) g_last_shop = v;
+    }
+    CloseHandle(h);
+}
+static void smm_write_last_shop(int id)
+{
+    wchar_t path[MAX_PATH];
+    HANDLE h;
+    char buf[32];
+    DWORD n;
+    if (!smm_game_path(path, L"ShroMagicMenu-lastshop.txt")) return;
+    h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    n = (DWORD)_snprintf_s(buf, sizeof(buf), _TRUNCATE, "0x%X\r\n", id);
+    WriteFile(h, buf, n, &n, NULL);
+    CloseHandle(h);
+}
+
+/* Moogles are the shops whose shopkeeper is a moogle object: 0x487 (every world's moogle) or
+   0x50F (Hollow Bastion's). Seen in the shop table: these are the shops that offer synthesis. */
+static int smm_is_moogle(WORD keeper) { return keeper == 0x487 || keeper == 0x50F; }
+
+static const BYTE *smm_shop_entry(int id, int *count);
+
+/* exe+1518E0, OpenShop(id): every shop the game opens, a shopkeeper's or ours. */
+static void SMM_GAME_ABI smm_on_open_shop(int id)
+{
+    int count;
+    const BYTE *e;
+    if (g_shop_ours || !g_shop_table) return;
+    e = smm_shop_entry(id, &count);
+    if (!e) return;
+    if (!smm_is_moogle((WORD)(e[6] | e[7] << 8))) { smm_logv("Shop 0x%X opened (not a moogle)", id); return; }
+    if (id != g_last_shop) {
+        g_last_shop = id;
+        smm_write_last_shop(id);
+        smm_log("Moogle shop 0x%X opened (world %02X room %02X): remembered for the shop keybind", id, rd8(SMM_WORLD), rd8(SMM_WORLD + 1));
+    }
+}
+
 static int smm_resolve_shop(void)
 {
     DWORD f, t, test;
@@ -874,6 +983,27 @@ static int smm_resolve_shop(void)
     g_shop_var = smm_rip(f + 0x28, 2, 6);
     g_open_shop = (SmmShopFn)(g_base + f);
     smm_log("Remote shop: OpenShop exe+%06X, shop id variable exe+%06X (expected exe+716B50)", f, g_shop_var);
+    /* The shopkeeper model check. Without it the remote shop crashes away from the shopkeeper. */
+    if (g_targets[T_KEEPERMODEL].count != 1 || g_targets[T_KEEPERENTRY].count != 1) {
+        smm_log("Remote shop unavailable: the shopkeeper model code was not found.");
+        return 0;
+    }
+    {
+        DWORD m = g_targets[T_KEEPERMODEL].found, en = g_targets[T_KEEPERENTRY].found;
+        DWORD path = smm_rip(m + 0x0F, 1, 5), load = smm_rip(m + 0x19, 1, 5), entry = smm_rip(en + 0x07, 1, 5), find;
+        static const BYTE load_head[6] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20 };
+        /* exe+39CC40 starts with push rbx / sub rsp,20h / call <cache lookup>. */
+        if (memcmp(g_base + load, load_head, 6) != 0 || g_base[load + 6] != 0xE8) {
+            smm_log("Remote shop unavailable: unexpected shopkeeper model code at exe+%06X.", m);
+            return 0;
+        }
+        find = smm_rip(load + 6, 1, 5);
+        g_obj_entry = (SmmEntryFn)(g_base + entry);
+        g_obj_path = (SmmPathFn)(g_base + path);
+        g_res_find = (SmmFindFn)(g_base + find);
+        smm_log("Remote shop: object entry exe+%06X (expected exe+3DFEB0), model path exe+%06X (expected exe+3E0B50),", entry, path);
+        smm_log("             model cache lookup exe+%06X (expected exe+39E1E0)", find);
+    }
     return 1;
 }
 
@@ -1122,25 +1252,44 @@ static void SMM_GAME_ABI smm_on_pause_setup(void)
 /* 1 = the shop opened. */
 static int smm_do_shop(const char *how)
 {
-    const BYTE *e;
-    int count;
-    WORD flag;
+    BYTE *e;
+    int count, id;
+    WORD flag, keeper;
     if (smm_on_world_map()) { smm_log("%s: no shops on the World Map", how); return 0; }
     if (rd8(SMM_BTLTYP) != 0) { smm_log("%s: shops only open out of battle", how); return 0; }
     if (smm_in_cutscene()) { smm_log("%s: shops do not open during cutscenes", how); return 0; }
     if (!g_shop_listed) smm_list_shops();
-    e = smm_shop_entry(g_cfg.shop_id, &count);
+    id = g_cfg.shop_id >= 0 ? g_cfg.shop_id : g_last_shop >= 0 ? g_last_shop : SMM_DEFAULT_SHOP;
+    e = (BYTE *)smm_shop_entry(id, &count);
     if (!count) { smm_log("%s: the shop table is not loaded", how); return 0; }
-    if (!e) { smm_log("%s: the game has no shop 0x%X (see the list above); check ShopId", how, g_cfg.shop_id); return 0; }
+    if (!e) { smm_log("%s: the game has no shop 0x%X (see the list above); check ShopId", how, id); return 0; }
     flag = (WORD)(e[2] | e[3] << 8);
     if (g_cfg.shop_visited_only && !smm_flag(flag)) {
-        smm_log("%s: shop 0x%X is not unlocked in this save yet (flag %X), skipped (VisitedOnly = 1)", how, g_cfg.shop_id, flag);
+        smm_log("%s: shop 0x%X is not unlocked in this save yet (flag %X), skipped (VisitedOnly = 1)", how, id, flag);
         return 0;
     }
-    smm_log("%s: opening shop 0x%X (world %02X room %02X)", how, g_cfg.shop_id, rd8(SMM_WORLD), rd8(SMM_WORLD + 1));
-    g_open_shop(g_cfg.shop_id);
-    if ((int)rd32(g_shop_var) != g_cfg.shop_id) {
+    /* The shopkeeper's model must already be loaded here, or the shop crashes. Otherwise Sora
+       (the player's own model, always loaded) stands in until the shop closes. */
+    smm_keeper_restore("new shop");
+    keeper = (WORD)(e[6] | e[7] << 8);
+    if (!smm_model_loaded(keeper)) {
+        if (!smm_model_loaded(SMM_OBJ_PLAYER)) {
+            smm_log("%s: shopkeeper %X is not loaded here and neither is the player model; not opening (it would crash)", how, keeper);
+            return 0;
+        }
+        g_keeper_orig = keeper;
+        g_keeper_swapped = e;
+        e[6] = (BYTE)(SMM_OBJ_PLAYER & 0xFF); e[7] = (BYTE)(SMM_OBJ_PLAYER >> 8);
+        smm_log("%s: shopkeeper %X is not loaded here, Sora stands in", how, keeper);
+    }
+    smm_log("%s: opening shop 0x%X%s (world %02X room %02X)", how, id, g_cfg.shop_id < 0 ? " (last moogle)" : "",
+            rd8(SMM_WORLD), rd8(SMM_WORLD + 1));
+    g_shop_ours = 1;
+    g_open_shop(id);
+    g_shop_ours = 0;
+    if ((int)rd32(g_shop_var) != id) {
         smm_log("%s: the game did not open it (a menu is busy)", how);
+        smm_keeper_restore("shop not opened");
         return 0;
     }
     return 1;
@@ -1268,6 +1417,7 @@ static void SMM_GAME_ABI smm_on_frame(void)
     if (g_cfg.party_battle && !smm_on_world_map() && g_base[g_slot1] != 0)
         g_base[g_slot1] = 0;
     if (g_pause_phase) smm_pause_step();
+    if (g_keeper_swapped && rd32(g_shop_var) == 0xFFFFFFFF) smm_keeper_restore("shop closed");
     if (g_gate_ok) smm_dpad_step();
 
     btl = rd8(SMM_BTLTYP);
@@ -1346,6 +1496,19 @@ static int cave_loop(BYTE *c, const void *fn, const BYTE *orig5, const BYTE *bac
 
 /* Pause setup: keep rax (the setup's last call result), call fn(), run the original 5 bytes,
    jump back. */
+/* OpenShop entry: keep rcx (the shop id), call fn(id), run the original 6 bytes
+   (push rbx / sub rsp,20h), jump back. */
+static int cave_openshop(BYTE *c, const void *fn, const BYTE *orig6, const BYTE *back)
+{
+    static const BYTE tail[] = { 0x48, 0x89, 0xEC, 0x5D, 0x59 };              /* mov rsp,rbp; pop rbp; pop rcx */
+    int n = put_bytes(c, 0, (const BYTE *)"\x51", 1);                         /* push rcx */
+    n = put_bytes(c, n, CAVE_ALIGN_PRO, sizeof(CAVE_ALIGN_PRO));
+    n = put_call(c, n, fn);                                                   /* rcx is still the id */
+    n = put_bytes(c, n, tail, sizeof(tail));
+    n = put_bytes(c, n, orig6, 6);
+    return put_jmp(c, n, back);
+}
+
 static int cave_setup(BYTE *c, const void *fn, const BYTE *orig5, const BYTE *back)
 {
     static const BYTE tail[] = { 0x48, 0x89, 0xEC, 0x5D, 0x58 };              /* mov rsp,rbp; pop rbp; pop rax */
@@ -1435,7 +1598,7 @@ static void smm_install_hooks(void)
     unsigned i;
     int lens[SMM_HOOK_COUNT];
     BYTE setup_orig[5];
-    int setup_len = 0;
+    int setup_len = 0, openshop_len = 0;
     int dpad = (g_cfg.save_on && g_cfg.save_bind.trig != SMM_TRIG_START) ||
                (g_cfg.pause_on && g_cfg.pause_bind.trig != SMM_TRIG_START) ||
                (g_cfg.load_on && g_cfg.load_bind.trig != SMM_TRIG_START) ||
@@ -1521,6 +1684,16 @@ static void smm_install_hooks(void)
     if (g_setup_hook)
         setup_len = cave_setup(block + 0x300, (const void *)(UINT_PTR)smm_on_pause_setup, setup_orig,
                                g_base + g_setup_hook + 5);
+    /* Remote shop "Last": a hook at OpenShop's entry remembers the moogles the player talks to. */
+    g_openshop_hook = 0;
+    if (g_cfg.shop_on && g_shop_ok) {
+        static const BYTE head[6] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20 };   /* push rbx; sub rsp,20h */
+        DWORD f = g_targets[T_OPENSHOP].found;
+        if (memcmp(g_base + f, head, 6) == 0) {
+            openshop_len = cave_openshop(block + 0x380, (const void *)(UINT_PTR)smm_on_open_shop, head, g_base + f + 6);
+            g_openshop_hook = f;
+        } else smm_log("Last moogle tracking unavailable: unexpected bytes at OpenShop.");
+    }
     FlushInstructionCache(GetCurrentProcess(), block, 0x400);
 
     for (i = 0; i < SMM_HOOK_COUNT; i++) {
@@ -1553,6 +1726,17 @@ static void smm_install_hooks(void)
             g_cfg.load_on = 0;
         }
     }
+    /* Optional: last moogle tracking. 5-byte jump over the 6-byte prologue; the cave returns to +6. */
+    if (g_openshop_hook) {
+        if (smm_write_jump(g_base + g_openshop_hook, block + 0x380))
+            smm_log("PATCHED: %-22s exe+%06X -> cave %p (%d bytes)", "OpenShop (last moogle)", g_openshop_hook, block + 0x380, openshop_len);
+        else { smm_log("Last moogle tracking unavailable: could not write the OpenShop hook."); g_openshop_hook = 0; }
+    }
+    smm_read_last_shop();
+    if (g_cfg.shop_on && g_cfg.shop_id < 0) {
+        if (g_last_shop >= 0) smm_log("Remote shop: last moogle remembered, shop 0x%X", g_last_shop);
+        else smm_log("Remote shop: no moogle remembered yet, using 0x%X (Hollow Bastion)", SMM_DEFAULT_SHOP);
+    }
 
     smm_log("Ready:");
     smm_log("  Save menu:     %s", g_cfg.save_on ? g_save_name : "off");
@@ -1567,7 +1751,8 @@ static void smm_install_hooks(void)
         else smm_log("  Custom pause:  off");
     }
     smm_log("  Load menu:     %s", g_cfg.load_on ? g_load_name : "off");
-    if (g_cfg.shop_on) smm_log("  Remote shop:   %s (shop 0x%X%s)", g_shop_name, g_cfg.shop_id, g_cfg.shop_visited_only ? ", once unlocked" : "");
+    if (g_cfg.shop_on && g_cfg.shop_id < 0) smm_log("  Remote shop:   %s (last moogle%s)", g_shop_name, g_cfg.shop_visited_only ? ", once unlocked" : "");
+    else if (g_cfg.shop_on) smm_log("  Remote shop:   %s (shop 0x%X%s)", g_shop_name, g_cfg.shop_id, g_cfg.shop_visited_only ? ", once unlocked" : "");
     else smm_log("  Remote shop:   off");
     smm_log("  Party menu:    in battle %s, in missions %s", g_cfg.party_battle ? "on" : "off", g_cfg.party_missions ? "on" : "off");
 }
