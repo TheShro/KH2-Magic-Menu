@@ -56,7 +56,7 @@
 #include <stdarg.h>
 #include <string.h>
 
-#define SMM_VERSION "1.9-test3"
+#define SMM_VERSION "1.9"
 
 /* ---------------------------------------------------------------- data addresses (Steam Global) */
 #define SMM_SHOULDERS     0x7133EB   /* controller: L2=01 R2=02 L1=04 R1=08 (+face buttons above) */

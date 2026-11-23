@@ -1,6 +1,6 @@
 # KH2-Magic-Menu
 
-Shro's Magic Menu (v1.8): KSX's menu Lua scripts reworked as a native .DLL, with additional features.
+Shro's Magic Menu (v1.9): KSX's menu Lua scripts reworked as a native .DLL, with additional features.
 
 KH2 Final Mix, PC (Steam Global, Nov 2026 build). Loaded by OpenKH Panacea. Idea and original
 scripts by KSX.
@@ -11,12 +11,14 @@ scripts by KSX.
 |---|---|
 | **R1 + Start** | Save point menu, instantly |
 | **R2 + Start** | **Custom pause**: Save / Load Game / Jiminy's Journal / Continue, anywhere but the World Map (field, battles, missions) |
+| **L1 + Start** | **Load Game** screen straight away (backing out shows the custom pause; Continue resumes) |
+| **L2 + Start** | **Remote shop**: the last moogle you talked to, from anywhere outside battle (synthesis included) |
 | **Start in any battle** | Party menu, missions included |
 | Start outside battle | Unchanged: cutscene skip menus and minigames work as normal |
 
-The party menu is never forced during cutscenes or on the World Map. Load sits behind the custom
-pause on purpose, as an extra confirmation step. World Map appears in the save menu wherever the
-game allows travel.
+The party menu is never forced during cutscenes or on the World Map. World Map appears in the save
+menu wherever the game allows travel. Jiminy's Journal is only offered once the story has unlocked
+it, and the remote shop only opens shops your save has unlocked.
 
 ## Settings: ShroMagicMenu.ini
 
@@ -34,6 +36,10 @@ affected setting keeps its default.
 | `[CustomPause] ShowSave` / `ShowLoadGame` / `ShowJournal` | 1 / 1 / 1 | Which buttons the pause shows (Continue always) |
 | `[CustomPause] GameRetryPause` | 1 | In fights the game can restart (Coliseum cups, minigames, missions whose own pause offers Retry / Prepare & Retry), the pause keybind opens the game's own pause, untouched, so Retry works. Plain Start still gives the party menu. |
 | `[CustomPause] ForceWorldTravel` | 0 | Offer World Map in the save menu even where the story has travel locked. **Leaving a world mid-story or mid-mission can softlock the game**: keep a separate save from before you travel. |
+| `[LoadMenu] Enabled` / `Keybind` | 1 / `L1+Start` | The pause, opened on its Load Game screen |
+| `[RemoteShop] Enabled` / `Keybind` | 1 / `L2+Start` | Remote shop on/off, keybind |
+| `[RemoteShop] ShopId` | `Last` | `Last` = the last moogle you talked to (kept in `ShroMagicMenu-lastshop.txt`; the Hollow Bastion moogle, 0x13, until you have talked to one), or a shop id such as `0x13`. The log lists every shop id the first time the keybind is used |
+| `[RemoteShop] VisitedOnly` | 1 | Only shops whose unlock flag is set in the save (you have met that shopkeeper) |
 | `[PartyMenu] InBattle` | 1 | Start in battle opens the party menu instead of the battle pause |
 | `[PartyMenu] InMissions` | 1 | The same in mission battles that have their own pause (outside cutscenes) |
 | `[Log] Enabled` | 1 | Write ShroMagicMenu.log |
@@ -43,8 +49,8 @@ affected setting keeps its default.
 last one, `Start` or a D-pad direction (`Up Down Left Right`). Examples: `R1+Start`,
 `L1+R1+Start`, `L2+R2+Up`. `None` switches a keybind off. Every keybind needs at least one
 shoulder button (plain Start stays the game's own; the D-pad alone drives the command menu), and
-exactly those shoulder buttons must be held. If both keybinds are the same, the custom pause is
-switched off.
+exactly those shoulder buttons must be held. If two features share a keybind, the later one in the
+file is switched off. Face buttons are not accepted (they would clash with gameplay).
 
 D-pad keybinds go through the same five checks the game runs before it accepts Start (menus,
 events and the like), so they only fire where Start would pause. Our keybinds work in missions
@@ -82,9 +88,26 @@ untouched.
 2 (`mov ecx,2`), and the save menu greys out World Map in mode 2. The module changes that 2 to 3
 once at load, and for the save menu keybind clears a leftover mode 2 before opening.
 
+## How the Load keybind and the remote shop work
+
+**Load**: the keybind opens the custom pause, and a hook at the end of the pause's setup
+(exe+31D34D) makes its first screen 3, the load screen (the one the Load Game button asks for),
+instead of 9, the button page. Backing out of Load returns to the button page as usual.
+
+**Remote shop**: the keybind calls the game's own OpenShop(id) (exe+1518E0), the function its event
+code calls when you talk to a shopkeeper. Forcing a Shop reaction command onto Triangle does not
+work: a reaction command runs on the object it belongs to (the moogle), so without one nearby the
+game crashes. The shop screen shows its shopkeeper as a 3D model and can only use a model that is
+already loaded where you stand, so the module checks the game's model cache first and, if the
+shopkeeper is not loaded, puts the game's "current player" object (Sora) in its place until the
+shop closes. A hook at OpenShop's entry remembers the moogle shops you open by talking to a moogle.
+
+The story flags (Save+2390, exe+9ABC40) decide the rest: each shop's unlock flag for VisitedOnly,
+and flag 0x73 (Save+239E) for the Journal button.
+
 ## How it works
 
-- At load it finds six game functions by byte signature and logs them, with the addresses decoded
+- At load it finds eleven pieces of game code by byte signature and logs them, with the addresses decoded
   from inside them.
 - It installs three 5-byte hooks in the game's Start-button and main-loop code, at sites with no
   rip-relative operands:
@@ -94,6 +117,9 @@ once at load, and for the save menu keybind clears a leftover mode 2 before open
   - **exe+157312** (`mov edx,-1`): Start keybinds.
   - **exe+15732A**: once per main-loop pass: clears the battle pause slot's active byte, D-pad
     keybinds, custom pause tidy-up, and (verbose) battle type and cutscene changes.
+  - Optional: **exe+31D34D** (end of the pause setup, Load keybind) and **exe+1518E0** (OpenShop's
+    entry, last moogle).
+- If the game crashes, the log records where (exe offset, registers, call chain).
 - Every code address is read out of the game's own code at load, with cross-checks. Hooks are
   written once in DllMain, all or nothing. Optional parts (custom pause, D-pad keybinds,
   ForceWorldTravel) switch off on their own if their code looks different. It refuses to run on
@@ -103,8 +129,8 @@ once at load, and for the save menu keybind clears a leftover mode 2 before open
 
 1. Run `build_msvc64.bat`, check for `8664 machine (x64)`.
 2. Copy `mod\ShroMagicMenu.dll` into your mod folder under `openkh\mods\kh2\`, rebuild in Mods
-   Manager. The log's first line should say `Shro's Magic Menu 1.8`, followed by the settings line,
-   three `PATCHED:` lines and a `Ready:` summary of the active keybinds.
+   Manager. The log's first line should say `Shro's Magic Menu 1.9`, followed by the settings line,
+   five `PATCHED:` lines and a `Ready:` summary of the active keybinds.
 3. Remove the old Lua script, if any; this module replaces it.
 
 ## Test (from a save)
@@ -116,8 +142,9 @@ once at load, and for the save menu keybind clears a leftover mode 2 before open
 4. `[PartyMenu] InBattle = 0`: Start in battle gives the battle pause again.
 5. Coliseum cup (or any fight whose pause had Retry): R2 + Start shows the game's pause with Retry;
    the log says "the game's pause offers Retry here". Plain Start gives the party menu.
-6. Optional, from a spare save: `ForceWorldTravel = 1`, then Save from the custom pause shows
-   World Map. The log says `ForceWorldTravel ON`.
+. L1 + Start in the field and in battle: the load screen; backing out shows the pause buttons.
+8. Talk to a moogle, then L2 + Start elsewhere: that moogle's shop, with Sora shown when the moogle
+   is not nearby. The log says "remembered for the shop keybind". In battle it does nothing.
 
 ## Tests (for development)
 
