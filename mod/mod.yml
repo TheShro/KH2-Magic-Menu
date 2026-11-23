@@ -1,0 +1,8 @@
+title: Shro's Magic Menu (native module)
+originalAuthor: KSX (idea and original scripts), Shro and Claude
+description: R1 + Start opens the save point menu. R2 + Start opens a pause with Save / Load Game / Journal / Continue. Start in battle opens the party menu, missions included. Keybinds and features are set in ShroMagicMenu.ini next to the game exe (written on first run). Logs to ShroMagicMenu.log.
+assets:
+- name: dll/ShroMagicMenu.dll
+  method: copy
+  source:
+  - name: ShroMagicMenu.dll

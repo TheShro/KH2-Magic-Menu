@@ -1,0 +1,22 @@
+# Build output
+build/
+*.obj
+*.dll
+*.exp
+*.lib
+*.pdb
+
+# Test binaries
+tests/h3
+tests/h5*
+tests/*.exe
+
+# Game files: Square Enix's code, never commit
+*.exe
+*.asm
+tests/dump_bytes.h
+dumps/
+
+# Local settings and logs
+ShroMagicMenu.ini
+ShroMagicMenu.log
