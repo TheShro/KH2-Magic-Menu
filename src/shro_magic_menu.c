@@ -21,6 +21,14 @@
  *      pause, take the normal path instead (party menu), except in cutscenes, on the World Map
  *      or while KSX's Lua anywhere pause is armed. Our own Start keybinds always take the normal
  *      path in battle, so they work in missions even with this off.
+ *   5. Load menu keybind (default L1 + Start): the custom pause, opened straight on its Load Game
+ *      screen (a hook at the end of the pause's setup makes Load the first screen).
+ *   6. Remote shop keybind (default L2 + Start, out of battle): calls the game's own OpenShop(id),
+ *      the function its event code calls when a shopkeeper is talked to, with the shop id from
+ *      the settings. By default only shops whose unlock flag is set in the save (the player has
+ *      met that shopkeeper). Not the reaction-command route: running a reaction command needs
+ *      the target object it belongs to (e.g. the moogle), and without one the game crashes.
+ *   The Journal button is only offered once the story has unlocked Jiminy's Journal (flag 0x73).
  *   Keybinds are shoulder buttons plus Start, or shoulder buttons plus a D-pad direction. A D-pad
  *   bind only fires when the game's own "may Start pause now?" checks (the five tests in front of
  *   the Start code) pass, so it behaves like Start would.
@@ -48,7 +56,7 @@
 #include <stdarg.h>
 #include <string.h>
 
-#define SMM_VERSION "1.8"
+#define SMM_VERSION "1.9-test"
 
 /* ---------------------------------------------------------------- data addresses (Steam Global) */
 #define SMM_SHOULDERS     0x7133EB   /* controller: L2=01 R2=02 L1=04 R1=08 (+face buttons above) */
@@ -96,6 +104,10 @@ typedef struct {
     int game_retry;
     int party_battle, party_missions;
     int log_on, log_verbose;
+    int load_on;  SmmBind load_bind;
+    int shop_on;  SmmBind shop_bind;
+    int shop_id;
+    int shop_visited_only;
 } SmmConfig;
 static const SmmConfig SMM_DEFAULTS = {
     1, { 0x08, SMM_TRIG_START },       /* save menu: R1 + Start */
@@ -104,7 +116,11 @@ static const SmmConfig SMM_DEFAULTS = {
     0,                                 /* ForceWorldTravel off */
     1,                                 /* GameRetryPause on */
     1, 1,                              /* party menu in battle, in missions */
-    1, 0                               /* log on, verbose off */
+    1, 0,                              /* log on, verbose off */
+    1, { 0x04, SMM_TRIG_START },       /* load menu: L1 + Start */
+    1, { 0x01, SMM_TRIG_START },       /* remote shop: L2 + Start */
+    0x13,                              /* shop: the Hollow Bastion moogle */
+    1                                  /* only shops the story has already unlocked */
 };
 static SmmConfig g_cfg;
 
@@ -140,6 +156,22 @@ static const char SMM_DEFAULT_INI[] =
 "; In fights where the game's own pause offers Retry / Prepare & Retry (minigames, missions),\r\n"
 "; this keybind opens that pause instead, so you can retry. Plain Start still opens the party menu.\r\n"
 "GameRetryPause = 1\r\n"
+"\r\n"
+"[LoadMenu]\r\n"
+"; Opens the pause straight on the Load Game screen. Backing out of it shows the custom pause\r\n"
+"; buttons (Continue to resume). Not available on the World Map.\r\n"
+"Enabled = 1\r\n"
+"Keybind = L1+Start\r\n"
+"\r\n"
+"[RemoteShop]\r\n"
+"; Opens a shop from anywhere outside battle, the same way talking to its shopkeeper does.\r\n"
+"Enabled = 1\r\n"
+"Keybind = L2+Start\r\n"
+"; Which shop (hex like 0x13, or decimal). 0x13 = the Hollow Bastion moogle. The log lists\r\n"
+"; every shop the game knows the first time you use the keybind.\r\n"
+"ShopId = 0x13\r\n"
+"; 1 = only shops the story has already unlocked (you have met that shopkeeper).\r\n"
+"VisitedOnly = 1\r\n"
 "\r\n"
 "[PartyMenu]\r\n"
 "; Start in battle opens the party menu instead of the battle pause.\r\n"
@@ -251,6 +283,7 @@ static int smm_ieq(const char *a, const char *b)
 }
 
 static char g_save_name[40], g_pause_name[40];   /* "R1+Start" etc., for the log */
+static char g_load_name[40], g_shop_name[40];
 
 /* "R1+Start", "L2+R2+Up", "None". 1 = ok (trig 0 = none); 0 = error, reason in err. */
 static int smm_parse_bind(const char *text, SmmBind *b, char *err, size_t errn)
@@ -304,6 +337,29 @@ static const char *smm_bind_text(const SmmBind *b, char *out, size_t n)
     return out;
 }
 
+/* "0x13", "13h" or "19". 0 = not a number in 0..0xFFFF. */
+static int smm_parse_num(const char *v, int *out)
+{
+    unsigned long n = 0;
+    int base = 10, digits = 0;
+    if (v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) { base = 16; v += 2; }
+    else { const char *e = v + strlen(v); if (e > v && (e[-1] == 'h' || e[-1] == 'H')) base = 16; }
+    for (; *v; v++) {
+        int d;
+        if (*v >= '0' && *v <= '9') d = *v - '0';
+        else if (base == 16 && *v >= 'a' && *v <= 'f') d = *v - 'a' + 10;
+        else if (base == 16 && *v >= 'A' && *v <= 'F') d = *v - 'A' + 10;
+        else if (base == 16 && (*v == 'h' || *v == 'H') && v[1] == 0) break;
+        else return 0;
+        n = n * base + d;
+        if (n > 0xFFFF) return 0;
+        digits++;
+    }
+    if (!digits) return 0;
+    *out = (int)n;
+    return 1;
+}
+
 static int smm_parse_flag(const char *v, int *out)
 {
     if (smm_ieq(v, "1") || smm_ieq(v, "true") || smm_ieq(v, "yes") || smm_ieq(v, "on")) { *out = 1; return 1; }
@@ -341,9 +397,17 @@ static int smm_load_settings(int quiet)
         key = smm_trim(line);
         val = smm_trim(eq + 1);
         {
-            int *flag = NULL;
+            int *flag = NULL, *num = NULL;
             SmmBind *bind = NULL;
-            if (smm_ieq(section, "SaveMenu")) {
+            if (smm_ieq(section, "LoadMenu")) {
+                if (smm_ieq(key, "Enabled")) flag = &g_cfg.load_on;
+                else if (smm_ieq(key, "Keybind")) bind = &g_cfg.load_bind;
+            } else if (smm_ieq(section, "RemoteShop")) {
+                if (smm_ieq(key, "Enabled")) flag = &g_cfg.shop_on;
+                else if (smm_ieq(key, "Keybind")) bind = &g_cfg.shop_bind;
+                else if (smm_ieq(key, "ShopId")) num = &g_cfg.shop_id;
+                else if (smm_ieq(key, "VisitedOnly")) flag = &g_cfg.shop_visited_only;
+            } else if (smm_ieq(section, "SaveMenu")) {
                 if (smm_ieq(key, "Enabled")) flag = &g_cfg.save_on;
                 else if (smm_ieq(key, "Keybind")) bind = &g_cfg.save_bind;
             } else if (smm_ieq(section, "CustomPause")) {
@@ -361,7 +425,12 @@ static int smm_load_settings(int quiet)
                 if (smm_ieq(key, "Enabled")) flag = &g_cfg.log_on;
                 else if (smm_ieq(key, "Verbose")) flag = &g_cfg.log_verbose;
             }
-            if (flag) {
+            if (num) {
+                if (!smm_parse_num(val, num)) {
+                    if (!quiet) smm_log("Settings: [%s] %s = \"%s\" is not a number (like 0x13), default kept", section, key, val);
+                    problems++;
+                }
+            } else if (flag) {
                 if (!smm_parse_flag(val, flag)) {
                     if (!quiet) smm_log("Settings: [%s] %s = \"%s\" is not 1 or 0, default kept", section, key, val);
                     problems++;
@@ -384,14 +453,27 @@ static int smm_load_settings(int quiet)
     /* A keybind of None switches its feature off. */
     if (!g_cfg.save_bind.trig) g_cfg.save_on = 0;
     if (!g_cfg.pause_bind.trig) g_cfg.pause_on = 0;
-    if (g_cfg.save_on && g_cfg.pause_on && g_cfg.save_bind.mods == g_cfg.pause_bind.mods &&
-        g_cfg.save_bind.trig == g_cfg.pause_bind.trig) {
-        if (!quiet) smm_log("Settings: SaveMenu and CustomPause have the same keybind; the custom pause is OFF.");
-        g_cfg.pause_on = 0;
-        problems++;
+    if (!g_cfg.load_bind.trig) g_cfg.load_on = 0;
+    if (!g_cfg.shop_bind.trig) g_cfg.shop_on = 0;
+    /* Two features on one keybind: the later one in this list is switched off. */
+    {
+        struct { const char *name; int *on; const SmmBind *b; } F[4] = {
+            { "SaveMenu", &g_cfg.save_on, &g_cfg.save_bind }, { "CustomPause", &g_cfg.pause_on, &g_cfg.pause_bind },
+            { "LoadMenu", &g_cfg.load_on, &g_cfg.load_bind }, { "RemoteShop", &g_cfg.shop_on, &g_cfg.shop_bind },
+        };
+        int i, j;
+        for (j = 1; j < 4; j++)
+            for (i = 0; i < j; i++)
+                if (*F[i].on && *F[j].on && F[i].b->mods == F[j].b->mods && F[i].b->trig == F[j].b->trig) {
+                    if (!quiet) smm_log("Settings: %s and %s have the same keybind; %s is OFF.", F[i].name, F[j].name, F[j].name);
+                    *F[j].on = 0;
+                    problems++;
+                }
     }
     smm_bind_text(&g_cfg.save_bind, g_save_name, sizeof(g_save_name));
     smm_bind_text(&g_cfg.pause_bind, g_pause_name, sizeof(g_pause_name));
+    smm_bind_text(&g_cfg.load_bind, g_load_name, sizeof(g_load_name));
+    smm_bind_text(&g_cfg.shop_bind, g_shop_name, sizeof(g_shop_name));
     return problems;
 }
 
@@ -433,9 +515,28 @@ static SmmTarget g_targets[] = {
     { "SaveMode",
       "66 83 3D ?? ?? ?? ?? 01 75 0A B9 ?? 00 00 00 E8",
       0x31D4F9, 0, 0 },
+    /* RemoteShop only: the game's OpenShop(shop id), reached from its event code (exe+3AABE0,
+       one case of its switch) when a shopkeeper is talked to:
+       if no menu is open and menustate != 2: busy byte = 1, shop id = ecx, start the shop task. */
+    { "OpenShop",
+      "40 53 48 83 EC 20 8B D9 E8 ?? ?? ?? ?? 84 C0 75 27 83 3D ?? ?? ?? ?? 02 74 1E "
+      "48 8D 0D ?? ?? ?? ?? C6 05 ?? ?? ?? ?? 01 89 1D ?? ?? ?? ?? 48 83 C4 20 5B E9",
+      0x1518E0, 0, 0 },
+    /* RemoteShop only: the shop UI's lookup of a shop entry (table pointer, then a 0x18-byte
+       entry per shop: id, unlock flag, name, shopkeeper, ...) and its unlock-flag test. */
+    { "ShopTable",
+      "4C 8B 3D ?? ?? ?? ?? 44 8B C6 45 0F BF 4F 06 49 8D 5F 10 45 85 C9 0F 8E",
+      0x2FBA5E, 0, 0 },
+    /* LoadMenu only: end of the pause's setup (exe+31D200), right after it starts the pause's
+       screen task; the setup has just written current screen = 9 (button page), request = -1. */
+    { "PauseSetupEnd",
+      "C7 44 24 30 8C 00 00 00 48 89 4C 24 28 4C 8D 0D ?? ?? ?? ?? 33 D2 C7 44 24 20 00 10 00 00 "
+      "48 8B 48 08 41 B8 CE 07 00 00 E8 ?? ?? ?? ?? 48 8B 5C 24 50 48 8B 74 24 58 48 83 C4 40 5F C3",
+      0x31D320, 0, 0 },
 };
 #define SMM_TARGET_COUNT (sizeof(g_targets) / sizeof(g_targets[0]))
-enum { T_OPENMENU = 0, T_STARTCHECK = 1, T_PAUSESELECT = 2, T_PAUSETAIL = 3, T_BUTTONS = 4, T_SAVEMODE = 5 };
+enum { T_OPENMENU = 0, T_STARTCHECK = 1, T_PAUSESELECT = 2, T_PAUSETAIL = 3, T_BUTTONS = 4, T_SAVEMODE = 5,
+       T_OPENSHOP = 6, T_SHOPTABLE = 7, T_PAUSESETUP = 8 };
 
 #define SMM_MAX_SIG 128
 
@@ -592,13 +693,17 @@ static DWORD pw_rd(const SmmWrite *w)
 }
 static void pw_wr(const SmmWrite *w, DWORD v) { memcpy(g_base + pw_addr(w), &v, w->size); }
 
+static int smm_flag(unsigned n);
+#define SMM_FLAG_JOURNAL 0x73
+
 static void smm_pause_fill(void)
 {
     WORD pairs[8] = { 0 };
     unsigned i, n = 0;
     if (g_cfg.show_save)    { pairs[n * 2] = SMM_FN_SAVE;    pairs[n * 2 + 1] = 0x8AAF; n++; }
     if (g_cfg.show_load)    { pairs[n * 2] = SMM_FN_LOAD;    pairs[n * 2 + 1] = 0xC52C; n++; }
-    if (g_cfg.show_journal) { pairs[n * 2] = SMM_FN_JOURNAL; pairs[n * 2 + 1] = 0x8AB7; n++; }
+    /* Jiminy's Journal only once the story has unlocked it (flag 0x73, Save+239E bit 8). */
+    if (g_cfg.show_journal && smm_flag(SMM_FLAG_JOURNAL)) { pairs[n * 2] = SMM_FN_JOURNAL; pairs[n * 2 + 1] = 0x8AB7; n++; }
     pairs[n * 2] = SMM_FN_CONTINUE; pairs[n * 2 + 1] = 0x8AB4; n++;
     for (i = 0; i < PAUSE_WRITE_COUNT; i++) g_pause_val[i] = PAUSE_WRITES[i].value;
     g_pause_val[1] = n;
@@ -727,6 +832,91 @@ static void smm_apply_force(void)
             g_force_imm, g_save_mode);
 }
 
+/* ---------------------------------------------------------------- story flags, remote shop */
+/* The game's flag bit array (Save+0x2390, exe+9ABC40), read by its flag test exe+3E38F0: bit n =
+   dword [array + (n>>5)*4] bit (n&31). The "menu flags" of the plando wiki are these bits, e.g.
+   0x70 Items, 0x71 Party, 0x72 Customize, 0x73 Jiminy's Journal (Save+239E), and each shop's
+   unlock flag. Found through the shop code; 0 = unknown (then nothing is hidden or refused). */
+static DWORD g_flags = 0;
+
+static int smm_flag(unsigned n) { return g_flags ? (rd32(g_flags + (n >> 5) * 4) >> (n & 31)) & 1 : 1; }
+
+typedef void (SMM_GAME_ABI *SmmShopFn)(int);
+static SmmShopFn g_open_shop = NULL;   /* OpenShop(id), exe+1518E0 */
+static DWORD g_shop_var = 0;           /* the open shop's id, -1 = none (exe+716B50) */
+static DWORD g_shop_table = 0;         /* qword: pointer to the loaded shop table (exe+BEE968) */
+static int g_shop_ok = 0, g_shop_listed = 0;
+
+static int smm_resolve_shop(void)
+{
+    DWORD f, t, test;
+    static const BYTE test_head[11] = { 0x8B, 0xC1, 0x8B, 0xD1, 0x48, 0xC1, 0xE8, 0x05, 0x48, 0x8D, 0x0D };
+    if (g_targets[T_SHOPTABLE].count != 1) { smm_log("Story flags / remote shop: the shop table code was not found."); return 0; }
+    t = g_targets[T_SHOPTABLE].found;
+    if (g_base[t + 0x49] != 0xE8) { smm_log("Story flags / remote shop: no flag test call in the shop code."); return 0; }
+    test = smm_rip(t + 0x49, 1, 5);
+    if (memcmp(g_base + test, test_head, 11) != 0) { smm_log("Story flags / remote shop: unexpected flag test at exe+%06X.", test); return 0; }
+    g_flags = smm_rip(test + 8, 3, 7);
+    g_shop_table = smm_rip(t, 3, 7);
+    smm_log("Story flags: flag array exe+%06X (expected exe+9ABC40); shop table pointer exe+%06X (expected exe+BEE968)",
+            g_flags, g_shop_table);
+    if (g_targets[T_OPENSHOP].count != 1) { smm_log("Remote shop unavailable: OpenShop was not found."); return 0; }
+    f = g_targets[T_OPENSHOP].found;
+    if (smm_rip(f + 0x11, 2, 7) != 0x716884) {
+        smm_log("Remote shop unavailable: OpenShop does not test menustate at exe+716884.");
+        return 0;
+    }
+    g_shop_var = smm_rip(f + 0x28, 2, 6);
+    g_open_shop = (SmmShopFn)(g_base + f);
+    smm_log("Remote shop: OpenShop exe+%06X, shop id variable exe+%06X (expected exe+716B50)", f, g_shop_var);
+    return 1;
+}
+
+/* The loaded shop table: word count at +6, entries from +0x10, 0x18 bytes each
+   (+0 shop id, +2 unlock flag, +4 name text, +6 shopkeeper). NULL if not loaded yet. */
+static const BYTE *smm_shop_entry(int id, int *count)
+{
+    UINT64 p;
+    const BYTE *tab;
+    int n, i;
+    memcpy(&p, g_base + g_shop_table, 8);
+    *count = 0;
+    if (!p) return NULL;
+    tab = (const BYTE *)(UINT_PTR)p;
+    n = (INT16)(tab[6] | tab[7] << 8);
+    if (n <= 0 || n > 512) return NULL;
+    *count = n;
+    for (i = 0; i < n; i++) {
+        const BYTE *e = tab + 0x10 + i * 0x18;
+        if ((INT16)(e[0] | e[1] << 8) == id) return e;
+    }
+    return NULL;
+}
+
+static void smm_list_shops(void)
+{
+    UINT64 p;
+    const BYTE *tab;
+    int n, i;
+    char line[400];
+    memcpy(&p, g_base + g_shop_table, 8);
+    if (!p) return;
+    tab = (const BYTE *)(UINT_PTR)p;
+    n = (INT16)(tab[6] | tab[7] << 8);
+    if (n <= 0 || n > 512) return;
+    g_shop_listed = 1;
+    smm_log("Shops the game knows (id: unlock flag, unlocked?, name text, shopkeeper):");
+    line[0] = 0;
+    for (i = 0; i < n; i++) {
+        const BYTE *e = tab + 0x10 + i * 0x18;
+        WORD id = (WORD)(e[0] | e[1] << 8), fl = (WORD)(e[2] | e[3] << 8), nm = (WORD)(e[4] | e[5] << 8), kp = (WORD)(e[6] | e[7] << 8);
+        char one[48];
+        _snprintf_s(one, sizeof(one), _TRUNCATE, "%s%X: %X %s %X %X", line[0] ? " | " : "  ", id, fl, smm_flag(fl) ? "yes" : "no", nm, kp);
+        strcat_s(line, sizeof(line), one);
+        if (strlen(line) > 300 || i == n - 1) { smm_log("%s", line); line[0] = 0; }
+    }
+}
+
 /* ---------------------------------------------------------------- D-pad keybinds: the game's own gate */
 /* In front of the Start code (StartCheck - 0x39 .. +0x15) the game runs five tests before it
    accepts Start. D-pad keybinds call the same functions and only act when all pass. */
@@ -830,14 +1020,19 @@ static int smm_slot_offers_retry(const BYTE *slot)
     return 0;
 }
 
-/* 1 = opened. */
-static int smm_do_pause(const char *how)
+/* LoadMenu: set just before our pause opens; the pause-setup hook (smm_on_pause_setup) then
+   makes the Load Game screen the pause's first screen. */
+static int g_load_pending = 0;
+static DWORD g_setup_hook = 0;         /* exe+31D34D, 0 = LoadMenu unavailable */
+
+/* 1 = opened. load = open it on the Load Game screen. */
+static int smm_do_pause(const char *how, int load)
 {
     BYTE *obj = g_last_obj;
     g_last_obj = NULL;
     if (smm_on_world_map()) { smm_logv("%s: not on the World Map", how); return 0; }
     /* A fight the game can restart: open the game's own pause, untouched (as vanilla Start). */
-    if (g_cfg.game_retry && obj && rd8(SMM_BTLTYP) != 0 && !smm_in_cutscene() && smm_slot_offers_retry(obj)) {
+    if (!load && g_cfg.game_retry && obj && rd8(SMM_BTLTYP) != 0 && !smm_in_cutscene() && smm_slot_offers_retry(obj)) {
         smm_log("%s: the game's pause offers Retry here, opening it (slot exe+%06X)", how, (unsigned)(obj - g_base));
         g_special_open(obj, NULL);
         return 1;
@@ -874,9 +1069,10 @@ static int smm_do_pause(const char *how)
         smm_log("%s: slot 3 is in use by the game (mission pause), using free slot %d (exe+%06X)",
                 how, 3 - (int)((g_slot3 - g_pause_slot) / 0x40), g_pause_slot);
     }
-    smm_log("%s: opening the custom pause", how);
+    smm_log(load ? "%s: opening the pause on the Load Game screen" : "%s: opening the custom pause", how);
     if (g_cfg.log_verbose) smm_log_pause_state("  pause state before");
     smm_pause_fill();
+    g_load_pending = load;
     g_special_open(g_base + g_pause_slot, NULL);
     /* The pause has taken the slot (BEF4A0); only the Start lookup reads the active byte, so
        disarm it now. Our main-loop hook does not run while the pause is up. The buttons stay
@@ -890,8 +1086,58 @@ static int smm_do_pause(const char *how)
 
 static void smm_pause_end(const char *why)
 {
+    if (g_load_pending) { smm_log("  Load Game: the pause never started, nothing changed"); g_load_pending = 0; }
     smm_pause_restore(why);
     g_pause_phase = 0;
+}
+
+/* exe+31D34D, end of the pause's setup (exe+31D200): current screen = 9 (button page) and
+   request = -1 were just written and the screen task started, which reads the current screen
+   when it first runs. Make that the Load Game screen (1). It is the same switch the Load Game
+   button makes (request 1 once the button page closes), minus the button page: backing out of
+   Load goes to screen 9 as usual, so the pause buttons appear and Continue resumes. */
+static void SMM_GAME_ABI smm_on_pause_setup(void)
+{
+    INT16 cur;
+    if (!g_load_pending) return;
+    g_load_pending = 0;
+    cur = (INT16)rd16(g_screen_cur);
+    if (cur != 9 || (INT16)rd16(g_screen_cur + 4) != -1) {
+        smm_log("  Load Game: unexpected pause screen %d / request %d, left alone", cur, (int)(INT16)rd16(g_screen_cur + 4));
+        return;
+    }
+    {
+        WORD one = 1;
+        memcpy(g_base + g_screen_cur, &one, 2);
+    }
+    smm_log("  Load Game: pause starts on the Load Game screen");
+}
+
+/* 1 = the shop opened. */
+static int smm_do_shop(const char *how)
+{
+    const BYTE *e;
+    int count;
+    WORD flag;
+    if (smm_on_world_map()) { smm_log("%s: no shops on the World Map", how); return 0; }
+    if (rd8(SMM_BTLTYP) != 0) { smm_log("%s: shops only open out of battle", how); return 0; }
+    if (smm_in_cutscene()) { smm_log("%s: shops do not open during cutscenes", how); return 0; }
+    if (!g_shop_listed) smm_list_shops();
+    e = smm_shop_entry(g_cfg.shop_id, &count);
+    if (!count) { smm_log("%s: the shop table is not loaded", how); return 0; }
+    if (!e) { smm_log("%s: the game has no shop 0x%X (see the list above); check ShopId", how, g_cfg.shop_id); return 0; }
+    flag = (WORD)(e[2] | e[3] << 8);
+    if (g_cfg.shop_visited_only && !smm_flag(flag)) {
+        smm_log("%s: shop 0x%X is not unlocked in this save yet (flag %X), skipped (VisitedOnly = 1)", how, g_cfg.shop_id, flag);
+        return 0;
+    }
+    smm_log("%s: opening shop 0x%X (world %02X room %02X)", how, g_cfg.shop_id, rd8(SMM_WORLD), rd8(SMM_WORLD + 1));
+    g_open_shop(g_cfg.shop_id);
+    if ((int)rd32(g_shop_var) != g_cfg.shop_id) {
+        smm_log("%s: the game did not open it (a menu is busy)", how);
+        return 0;
+    }
+    return 1;
 }
 
 /* Our main-loop hook does not run while a pause is open: seeing it run with no pause screen for
@@ -916,7 +1162,9 @@ static int smm_bind_held(const SmmBind *b, BYTE trig)
 static int smm_start_combo(void)
 {
     return (g_cfg.save_on && smm_bind_held(&g_cfg.save_bind, SMM_TRIG_START)) ||
-           (g_cfg.pause_on && g_pause_ok && smm_bind_held(&g_cfg.pause_bind, SMM_TRIG_START));
+           (g_cfg.pause_on && g_pause_ok && smm_bind_held(&g_cfg.pause_bind, SMM_TRIG_START)) ||
+           (g_cfg.load_on && smm_bind_held(&g_cfg.load_bind, SMM_TRIG_START)) ||
+           (g_cfg.shop_on && smm_bind_held(&g_cfg.shop_bind, SMM_TRIG_START));
 }
 
 /* With a special pause slot active: 1 = keep the game's special pause, 0 = take the normal path. */
@@ -965,7 +1213,11 @@ static int SMM_GAME_ABI smm_on_start(void)
         return 1;
     }
     if (g_cfg.pause_on && g_pause_ok && smm_bind_held(&g_cfg.pause_bind, SMM_TRIG_START))
-        return smm_do_pause(g_pause_name);
+        return smm_do_pause(g_pause_name, 0);
+    if (g_cfg.load_on && smm_bind_held(&g_cfg.load_bind, SMM_TRIG_START))
+        return smm_do_pause(g_load_name, 1);
+    if (g_cfg.shop_on && smm_bind_held(&g_cfg.shop_bind, SMM_TRIG_START))
+        return smm_do_shop(g_shop_name);
     return 0;
 }
 
@@ -982,16 +1234,22 @@ static BYTE g_last_dpad = 0;
 static void smm_dpad_step(void)
 {
     BYTE pad = rd8(SMM_DPAD) & SMM_TRIG_DPAD, fresh = (BYTE)(pad & ~g_last_dpad);
-    int save, pause;
+    int save, pause, load, shop;
+    const char *name;
     g_last_dpad = pad;
     if (!fresh || pad != fresh) return;                /* one direction, just pressed, nothing else held */
     save = g_cfg.save_on && smm_bind_held(&g_cfg.save_bind, pad);
     pause = g_cfg.pause_on && g_pause_ok && smm_bind_held(&g_cfg.pause_bind, pad);
-    if (!save && !pause) return;
-    if (!smm_game_accepts_start()) { smm_logv("%s: ignored, the game would not pause right now", save ? g_save_name : g_pause_name); return; }
+    load = g_cfg.load_on && smm_bind_held(&g_cfg.load_bind, pad);
+    shop = g_cfg.shop_on && smm_bind_held(&g_cfg.shop_bind, pad);
+    if (!save && !pause && !load && !shop) return;
+    name = save ? g_save_name : pause ? g_pause_name : load ? g_load_name : g_shop_name;
+    if (!smm_game_accepts_start()) { smm_logv("%s: ignored, the game would not pause right now", name); return; }
     if (g_pause_phase != 0) smm_pause_end("keybind pressed again");
     if (save) smm_do_save(g_save_name);
-    else smm_do_pause(g_pause_name);
+    else if (pause) smm_do_pause(g_pause_name, 0);
+    else if (load) smm_do_pause(g_load_name, 1);
+    else smm_do_shop(g_shop_name);
 }
 
 /* exe+15732A: once per main-loop pass. */
@@ -1080,6 +1338,19 @@ static int cave_loop(BYTE *c, const void *fn, const BYTE *orig5, const BYTE *bac
     return put_jmp(c, n, back);
 }
 
+/* Pause setup: keep rax (the setup's last call result), call fn(), run the original 5 bytes,
+   jump back. */
+static int cave_setup(BYTE *c, const void *fn, const BYTE *orig5, const BYTE *back)
+{
+    static const BYTE tail[] = { 0x48, 0x89, 0xEC, 0x5D, 0x58 };              /* mov rsp,rbp; pop rbp; pop rax */
+    int n = put_bytes(c, 0, (const BYTE *)"\x50", 1);                         /* push rax */
+    n = put_bytes(c, n, CAVE_ALIGN_PRO, sizeof(CAVE_ALIGN_PRO));
+    n = put_call(c, n, fn);
+    n = put_bytes(c, n, tail, sizeof(tail));
+    n = put_bytes(c, n, orig5, 5);
+    return put_jmp(c, n, back);
+}
+
 #ifndef SMM_TEST_ALLOC
 /* Executable memory within +-1.75 GB of 'target', so a 5-byte E9 jump reaches it. */
 static BYTE *smm_alloc_near(BYTE *target, SIZE_T size)
@@ -1157,10 +1428,15 @@ static void smm_install_hooks(void)
     BYTE *S, *block, orig[SMM_HOOK_COUNT][5];
     unsigned i;
     int lens[SMM_HOOK_COUNT];
+    BYTE setup_orig[5];
+    int setup_len = 0;
     int dpad = (g_cfg.save_on && g_cfg.save_bind.trig != SMM_TRIG_START) ||
-               (g_cfg.pause_on && g_cfg.pause_bind.trig != SMM_TRIG_START);
+               (g_cfg.pause_on && g_cfg.pause_bind.trig != SMM_TRIG_START) ||
+               (g_cfg.load_on && g_cfg.load_bind.trig != SMM_TRIG_START) ||
+               (g_cfg.shop_on && g_cfg.shop_bind.trig != SMM_TRIG_START);
 
-    if (!g_cfg.save_on && !g_cfg.pause_on && !g_cfg.party_battle && !g_cfg.party_missions) {
+    if (!g_cfg.save_on && !g_cfg.pause_on && !g_cfg.load_on && !g_cfg.shop_on &&
+        !g_cfg.party_battle && !g_cfg.party_missions) {
         smm_log("Every feature is switched off in ShroMagicMenu.ini: nothing patched.");
         return;
     }
@@ -1190,15 +1466,35 @@ static void smm_install_hooks(void)
     }
 
     /* Optional parts: each one is switched off on its own if its code looks different. */
-    g_pause_ok = (g_cfg.pause_on || dpad) ? smm_resolve_pause() : 0;
+    g_pause_ok = (g_cfg.pause_on || g_cfg.load_on || dpad) ? smm_resolve_pause() : 0;
     if (g_cfg.pause_on && !g_pause_ok) g_cfg.pause_on = 0;
     if (dpad) {
         g_gate_ok = g_pause_ok ? smm_resolve_gate() : 0;
         if (!g_gate_ok) {
             if (g_cfg.save_on && g_cfg.save_bind.trig != SMM_TRIG_START) g_cfg.save_on = 0;
             if (g_cfg.pause_on && g_cfg.pause_bind.trig != SMM_TRIG_START) g_cfg.pause_on = 0;
+            if (g_cfg.load_on && g_cfg.load_bind.trig != SMM_TRIG_START) g_cfg.load_on = 0;
+            if (g_cfg.shop_on && g_cfg.shop_bind.trig != SMM_TRIG_START) g_cfg.shop_on = 0;
             smm_log("D-pad keybinds are OFF (see above).");
         }
+    }
+    /* Story flags (Journal button) and the remote shop. */
+    g_shop_ok = smm_resolve_shop();
+    if (g_cfg.shop_on && !g_shop_ok) g_cfg.shop_on = 0;
+    /* LoadMenu: the custom pause plus a hook at the end of the pause's setup. */
+    if (g_cfg.load_on) {
+        static const BYTE site[5] = { 0x48, 0x8B, 0x5C, 0x24, 0x50 };      /* mov rbx,[rsp+50h] */
+        DWORD f = g_targets[T_PAUSESETUP].found;
+        g_setup_hook = 0;
+        if (!g_pause_ok) smm_log("Load menu unavailable: needs the custom pause code.");
+        else if (g_targets[T_PAUSESETUP].count != 1) smm_log("Load menu unavailable: the pause setup code was not found.");
+        else if (memcmp(g_base + f + 0x2D, site, 5) != 0) smm_log("Load menu unavailable: unexpected bytes at the pause setup hook site.");
+        else if (g_base[f - 0x81] != 0x66 || g_base[f - 0x80] != 0x89 || g_base[f - 0x7F] != 0x05 ||
+                 smm_rip(f - 0x81, 3, 7) != g_screen_cur)
+            smm_log("Load menu unavailable: exe+%06X is not the setup that writes the pause screen.", f);
+        else g_setup_hook = f + 0x2D;
+        if (!g_setup_hook) g_cfg.load_on = 0;
+        else memcpy(setup_orig, g_base + g_setup_hook, 5);
     }
     if (g_cfg.force_world) {
         if (g_pause_ok && smm_resolve_force()) smm_apply_force();
@@ -1216,7 +1512,10 @@ static void smm_install_hooks(void)
                                S + SMM_START_BACK, S + SMM_LOOP_OFF);
     lens[H_LOOP] = cave_loop(g_hooks[H_LOOP].cave, (const void *)(UINT_PTR)smm_on_frame, orig[H_LOOP],
                              S + SMM_LOOP_BACK);
-    FlushInstructionCache(GetCurrentProcess(), block, 0x300);
+    if (g_setup_hook)
+        setup_len = cave_setup(block + 0x300, (const void *)(UINT_PTR)smm_on_pause_setup, setup_orig,
+                               g_base + g_setup_hook + 5);
+    FlushInstructionCache(GetCurrentProcess(), block, 0x400);
 
     for (i = 0; i < SMM_HOOK_COUNT; i++) {
         if (!smm_write_jump(g_hooks[i].site, g_hooks[i].cave)) {
@@ -1238,6 +1537,16 @@ static void smm_install_hooks(void)
                 (unsigned)(g_hooks[i].site - g_base), g_hooks[i].cave, lens[i]);
     if (memcmp(orig[H_SPECIAL], g_hooks[H_SPECIAL].alt, 5) == 0)
         smm_log("(The Lua mission patch was already applied; this hook replaces it.)");
+    /* Optional: the Load menu's hook. If it cannot be written only the Load menu is off. */
+    if (g_setup_hook) {
+        if (smm_write_jump(g_base + g_setup_hook, block + 0x300))
+            smm_log("PATCHED: %-22s exe+%06X -> cave %p (%d bytes)", "pause setup (Load)", g_setup_hook, block + 0x300, setup_len);
+        else {
+            smm_log("Load menu unavailable: could not write the pause setup hook.");
+            g_setup_hook = 0;
+            g_cfg.load_on = 0;
+        }
+    }
 
     smm_log("Ready:");
     smm_log("  Save menu:     %s", g_cfg.save_on ? g_save_name : "off");
@@ -1245,12 +1554,15 @@ static void smm_install_hooks(void)
         char buttons[64] = "";
         if (g_cfg.show_save) strcat_s(buttons, sizeof(buttons), "Save, ");
         if (g_cfg.show_load) strcat_s(buttons, sizeof(buttons), "Load Game, ");
-        if (g_cfg.show_journal) strcat_s(buttons, sizeof(buttons), "Journal, ");
+        if (g_cfg.show_journal) strcat_s(buttons, sizeof(buttons), g_flags ? "Journal (once unlocked), " : "Journal, ");
         strcat_s(buttons, sizeof(buttons), "Continue");
         if (g_cfg.pause_on) smm_log("  Custom pause:  %s (%s)%s%s", g_pause_name, buttons, g_cfg.force_world ? ", ForceWorldTravel ON" : "",
                                     g_cfg.game_retry ? "; the game's Retry pause where offered" : "");
         else smm_log("  Custom pause:  off");
     }
+    smm_log("  Load menu:     %s", g_cfg.load_on ? g_load_name : "off");
+    if (g_cfg.shop_on) smm_log("  Remote shop:   %s (shop 0x%X%s)", g_shop_name, g_cfg.shop_id, g_cfg.shop_visited_only ? ", once unlocked" : "");
+    else smm_log("  Remote shop:   off");
     smm_log("  Party menu:    in battle %s, in missions %s", g_cfg.party_battle ? "on" : "off", g_cfg.party_missions ? "on" : "off");
 }
 
