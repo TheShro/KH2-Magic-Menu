@@ -56,7 +56,7 @@
 #include <stdarg.h>
 #include <string.h>
 
-#define SMM_VERSION "1.9-test"
+#define SMM_VERSION "1.9-test2"
 
 /* ---------------------------------------------------------------- data addresses (Steam Global) */
 #define SMM_SHOULDERS     0x7133EB   /* controller: L2=01 R2=02 L1=04 R1=08 (+face buttons above) */
@@ -679,8 +679,12 @@ static int g_pause_frames = 0;
 /* Pause buttons: [slot+4+i*4] = function, [slot+6+i*4] = text, read by the builder exe+31F3A0.
    The slot holds 4 (a 5th pair would land on the +0x16 word). Retry (3), game-over Continue (4)
    and Prepare & Retry (0x0C) only work from the Game Over screen: 4 crashed from a pause. */
-#define SMM_FN_SAVE      0x0001
-#define SMM_FN_LOAD      0x0011
+/* Function 1 (text 8AAF, shown as "Load Game") asks the pause for screen 3, the load screen;
+   function 0x11 (text C52C, shown as "Save") asks for screen 1, the save point menu. Before 1.9
+   these two names were swapped here, so ShowSave hid the Load Game button and vice versa. */
+#define SMM_FN_LOAD      0x0001
+#define SMM_FN_SAVE      0x0011
+#define SMM_SCREEN_LOAD  3
 #define SMM_FN_JOURNAL   0x000A
 #define SMM_FN_CONTINUE  0x0006
 
@@ -700,8 +704,9 @@ static void smm_pause_fill(void)
 {
     WORD pairs[8] = { 0 };
     unsigned i, n = 0;
-    if (g_cfg.show_save)    { pairs[n * 2] = SMM_FN_SAVE;    pairs[n * 2 + 1] = 0x8AAF; n++; }
-    if (g_cfg.show_load)    { pairs[n * 2] = SMM_FN_LOAD;    pairs[n * 2 + 1] = 0xC52C; n++; }
+    /* Shown in this order: Load Game, Save (as before 1.9). */
+    if (g_cfg.show_load)    { pairs[n * 2] = SMM_FN_LOAD;    pairs[n * 2 + 1] = 0x8AAF; n++; }
+    if (g_cfg.show_save)    { pairs[n * 2] = SMM_FN_SAVE;    pairs[n * 2 + 1] = 0xC52C; n++; }
     /* Jiminy's Journal only once the story has unlocked it (flag 0x73, Save+239E bit 8). */
     if (g_cfg.show_journal && smm_flag(SMM_FLAG_JOURNAL)) { pairs[n * 2] = SMM_FN_JOURNAL; pairs[n * 2 + 1] = 0x8AB7; n++; }
     pairs[n * 2] = SMM_FN_CONTINUE; pairs[n * 2 + 1] = 0x8AB4; n++;
@@ -773,7 +778,7 @@ static int smm_resolve_pause(void)
     memcpy(&v, g_base + h + 0x2F, 4); table = (DWORD)v;
     memcpy(&v, g_base + table + 0x10 * 4, 4); load_case = (DWORD)v;
     if (memcmp(g_base + load_case, case_load, 6) != 0) {
-        smm_log("Custom pause unavailable: the Load Game case is not 'mov ecx,1 / call'.");
+        smm_log("Custom pause unavailable: the Save button case is not 'mov ecx,1 / call'.");
         return 0;
     }
     req_fn = smm_rip(load_case + 5, 1, 5);
@@ -1093,8 +1098,9 @@ static void smm_pause_end(const char *why)
 
 /* exe+31D34D, end of the pause's setup (exe+31D200): current screen = 9 (button page) and
    request = -1 were just written and the screen task started, which reads the current screen
-   when it first runs. Make that the Load Game screen (1). It is the same switch the Load Game
-   button makes (request 1 once the button page closes), minus the button page: backing out of
+   when it first runs. Make that the load screen (3). It is the same switch the Load Game
+   button makes (function 1: request 3 once the button page closes; screen 1 is the save point
+   menu, which 1.9-test opened by mistake), minus the button page: backing out of
    Load goes to screen 9 as usual, so the pause buttons appear and Continue resumes. */
 static void SMM_GAME_ABI smm_on_pause_setup(void)
 {
@@ -1107,8 +1113,8 @@ static void SMM_GAME_ABI smm_on_pause_setup(void)
         return;
     }
     {
-        WORD one = 1;
-        memcpy(g_base + g_screen_cur, &one, 2);
+        WORD load = SMM_SCREEN_LOAD;
+        memcpy(g_base + g_screen_cur, &load, 2);
     }
     smm_log("  Load Game: pause starts on the Load Game screen");
 }
@@ -1641,6 +1647,58 @@ static DWORD WINAPI smm_retry_thread(LPVOID unused)
     return 0;
 }
 
+/* ---------------------------------------------------------------- crash report */
+/* If the game crashes, write where (exe+offset) and the code addresses on the stack to the log
+   before Windows ends it. Only real faults are logged (not the C++ exceptions games throw and
+   catch), at most a few, and the exception is always passed on unchanged. */
+#ifndef SMM_TEST_ALLOC
+static volatile LONG g_crash_logged = 0;
+static LONG CALLBACK smm_on_exception(EXCEPTION_POINTERS *ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    UINT_PTR rip, base = (UINT_PTR)g_base, end;
+    IMAGE_NT_HEADERS64 *nt;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
+        code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_ARRAY_BOUNDS_EXCEEDED)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedIncrement(&g_crash_logged) > 3 || !g_base) return EXCEPTION_CONTINUE_SEARCH;
+    nt = (IMAGE_NT_HEADERS64 *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
+    end = base + nt->OptionalHeader.SizeOfImage;
+    rip = (UINT_PTR)ep->ContextRecord->Rip;
+    if (rip >= base && rip < end)
+        smm_log("CRASH: exception %08X at exe+%06X", code, (unsigned)(rip - base));
+    else
+        smm_log("CRASH: exception %08X at %p (outside the game exe)", code, (void *)rip);
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
+        smm_log("  %s address %p", ep->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
+                (void *)ep->ExceptionRecord->ExceptionInformation[1]);
+    smm_log("  rax %llX rbx %llX rcx %llX rdx %llX rsi %llX rdi %llX",
+            ep->ContextRecord->Rax, ep->ContextRecord->Rbx, ep->ContextRecord->Rcx,
+            ep->ContextRecord->Rdx, ep->ContextRecord->Rsi, ep->ContextRecord->Rdi);
+    {
+        /* Return addresses into the game's code on the stack: the call chain, newest first. */
+        const UINT64 *sp = (const UINT64 *)(UINT_PTR)ep->ContextRecord->Rsp;
+        char line[400] = "";
+        int i, found = 0;
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(sp, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT) {
+            UINT_PTR top = (UINT_PTR)mbi.BaseAddress + mbi.RegionSize;
+            for (i = 0; i < 512 && (UINT_PTR)(sp + i + 1) <= top && found < 16; i++) {
+                if (sp[i] > base + 0x1000 && sp[i] < base + 0x579000) {
+                    char one[16];
+                    _snprintf_s(one, sizeof(one), _TRUNCATE, " exe+%06X", (unsigned)(sp[i] - base));
+                    strcat_s(line, sizeof(line), one);
+                    found++;
+                }
+            }
+        }
+        smm_log("  stack:%s", found ? line : " (no game code addresses)");
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 static void smm_start(void)
 {
     char marker[9] = { 0 };
@@ -1660,6 +1718,9 @@ static void smm_start(void)
     g_base = (BYTE *)GetModuleHandleW(NULL);
     smm_log("Game module base %p", g_base);
     if (!g_base) return;
+#ifndef SMM_TEST_ALLOC
+    if (g_cfg.log_on) AddVectoredExceptionHandler(0, smm_on_exception);
+#endif
 
     /* KSX's build check. The data addresses above are Steam Global only. */
     memcpy(marker, g_base + 0x585E59, 8);

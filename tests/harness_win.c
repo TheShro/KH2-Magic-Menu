@@ -87,7 +87,7 @@ int main(int argc, char **argv)
         check(r16(0x744C10) == 9 && r16(0x744C14) == 0xFFFF, "setup hook, no Load pending: pause starts on the button page (9)");
         g_load_pending = 1;
         ((void (*)(void))t)();
-        check(r16(0x744C10) == 1 && r16(0x744C14) == 0xFFFF && !g_load_pending, "setup hook, Load pending: pause starts on Load Game (1), request untouched");
+        check(r16(0x744C10) == 3 && r16(0x744C14) == 0xFFFF && !g_load_pending, "setup hook, Load pending: pause starts on the load screen (3), request untouched");
         w16(0x744C10, 3); g_load_pending = 1;
         ((void (*)(void))t)();
         check(r16(0x744C10) == 3 && !g_load_pending, "setup hook, unexpected screen: left alone");
@@ -162,6 +162,25 @@ int main(int argc, char **argv)
         check(smm_load_settings(0) == 2 && g_cfg.shop_id == 0x13 && !g_cfg.load_on, "bad ShopId keeps 0x13; face button refused");
         memcpy(g_ini_text, SMM_DEFAULT_INI, sizeof(SMM_DEFAULT_INI));
         check(smm_load_settings(0) == 0 && g_cfg.load_on && g_cfg.shop_on && g_cfg.shop_id == 0x13, "default settings file parses cleanly");
+    }
+
+    /* --- crash report: a fault is logged once and passed on to the next handler */
+    {
+        volatile int *bad = (volatile int *)(UINT_PTR)0x10;
+        int caught = 0;
+        __try { *bad = 1; } __except (EXCEPTION_EXECUTE_HANDLER) { caught = 1; }
+        check(caught && g_crash_logged == 1, "crash report logged, fault passed on");
+    }
+
+    /* --- custom pause buttons: function 1 / text 8AAF is the Load Game button */
+    {
+        set_flag(0x73, 1);
+        g_cfg.show_save = 0; g_cfg.show_load = 1; g_cfg.show_journal = 0;
+        smm_pause_fill(); smm_pause_restore("test");
+        check(g_pause_val[1] == 2 && g_pause_val[2] == 0x0001 && g_pause_val[3] == 0x8AAF, "ShowSave 0: only Load Game (1 / 8AAF) + Continue");
+        g_cfg.show_save = 1; g_cfg.show_load = 0;
+        smm_pause_fill(); smm_pause_restore("test");
+        check(g_pause_val[1] == 2 && g_pause_val[2] == 0x0011 && g_pause_val[3] == 0xC52C, "ShowLoadGame 0: only Save (11 / C52C) + Continue");
     }
 
     printf(fails ? "%d FAILED\n" : "ALL PASS\n", fails);
