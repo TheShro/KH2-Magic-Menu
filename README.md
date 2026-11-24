@@ -91,9 +91,11 @@ once at load, and for the save menu keybind clears a leftover mode 2 before open
 
 ## How the Load keybind and the remote shop work
 
-**Load**: the keybind opens the custom pause, and a hook at the end of the pause's setup
-(exe+31D34D) makes its first screen 3, the load screen (the one the Load Game button asks for),
-instead of 9, the button page. Backing out of Load returns to the button page as usual.
+**Load**: the keybind opens the custom pause, and a hook in the pause's screen task (exe+31D499),
+after it has built the button page, makes its first screen 3, the load screen (the one the Load
+Game button asks for), instead of 9, the button page. Backing out of Load returns to the button
+page as usual. (1.9 switched the screen before the button page was built; backing out of Load
+could then crash on stale objects, seen after a shop had been open. Fixed in 1.9.1.)
 
 **Remote shop**: the keybind calls the game's own OpenShop(id) (exe+1518E0), the function its event
 code calls when you talk to a shopkeeper. Forcing a Shop reaction command onto Triangle does not
@@ -125,8 +127,8 @@ and flag 0x73 (Save+239E) for the Journal button.
   - **exe+157312** (`mov edx,-1`): Start keybinds.
   - **exe+15732A**: once per main-loop pass: clears the battle pause slot's active byte, D-pad
     keybinds, custom pause tidy-up, and (verbose) battle type and cutscene changes.
-  - Optional: **exe+31D34D** (end of the pause setup: Load keybind, and the custom pause's
-    tidy-up) and **exe+1518E0** (OpenShop's entry, last moogle).
+  - Optional: **exe+31D499** (the pause's screen task, after the button page is built: Load
+    keybind, and the custom pause's tidy-up) and **exe+1518E0** (OpenShop's entry, last moogle).
 - Faults are logged as `FAULT` with where (exe offset, registers, call chain). The game catches
   some faults itself, so a `FAULT` line only means a crash if the game closed right after it.
 - Every code address is read out of the game's own code at load, with cross-checks. Hooks are

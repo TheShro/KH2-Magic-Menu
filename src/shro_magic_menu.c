@@ -269,6 +269,7 @@ static void smm_read_ini(void)
     DWORD got = 0;
 
     g_ini_text[0] = 0;
+    g_ini_state = 0;
     if (!smm_game_path(path, L"ShroMagicMenu.ini")) { g_ini_state = 3; return; }
     h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
@@ -561,12 +562,14 @@ static SmmTarget g_targets[] = {
     { "ShopTable",
       "4C 8B 3D ?? ?? ?? ?? 44 8B C6 45 0F BF 4F 06 49 8D 5F 10 45 85 C9 0F 8E",
       0x2FBA5E, 0, 0 },
-    /* LoadMenu only: end of the pause's setup (exe+31D200), right after it starts the pause's
-       screen task; the setup has just written current screen = 9 (button page), request = -1. */
-    { "PauseSetupEnd",
-      "C7 44 24 30 8C 00 00 00 48 89 4C 24 28 4C 8D 0D ?? ?? ?? ?? 33 D2 C7 44 24 20 00 10 00 00 "
-      "48 8B 48 08 41 B8 CE 07 00 00 E8 ?? ?? ?? ?? 48 8B 5C 24 50 48 8B 74 24 58 48 83 C4 40 5F C3",
-      0x31D320, 0, 0 },
+    /* LoadMenu: the pause's screen task (exe+31D3C0), once it has built the button page (its first
+       block runs only when the current screen is 9) and before it runs the first screen:
+       mov edx,1 / mov [flag],sil / mov rcx,rbx / call / cmp word [screen],4 / jne.
+       (1.9 switched the screen at the end of the setup, before the task ran, so the button page
+       was never built: backing out of Load then used stale objects and crashed.) */
+    { "PauseScreenTask",
+      "BA 01 00 00 00 40 88 35 ?? ?? ?? ?? 48 8B CB E8 ?? ?? ?? ?? 66 83 3D ?? ?? ?? ?? 04 75",
+      0x31D499, 0, 0 },
     /* RemoteShop only: the shop's 3D shopkeeper setup (exe+3E6120): model path from the object
        entry, then the model cache. The shop can only show a model that is already loaded. */
     { "ShopKeeperModel",
@@ -1248,10 +1251,10 @@ static int smm_slot_offers_retry(const BYTE *slot)
     return 0;
 }
 
-/* LoadMenu: set just before our pause opens; the pause-setup hook (smm_on_pause_setup) then
+/* LoadMenu: set just before our pause opens; the screen-task hook (smm_on_pause_task) then
    makes the Load Game screen the pause's first screen. */
 static int g_load_pending = 0;
-static DWORD g_setup_hook = 0;         /* exe+31D34D, 0 = LoadMenu unavailable */
+static DWORD g_setup_hook = 0;         /* exe+31D499 (pause screen task), 0 = LoadMenu unavailable */
 
 /* 1 = opened. load = open it on the Load Game screen. */
 static int smm_do_pause(const char *how, int load)
@@ -1319,13 +1322,14 @@ static void smm_pause_end(const char *why)
     g_pause_phase = 0;
 }
 
-/* exe+31D34D, end of the pause's setup (exe+31D200): current screen = 9 (button page) and
-   request = -1 were just written and the screen task started, which reads the current screen
-   when it first runs. Make that the load screen (3). It is the same switch the Load Game
-   button makes (function 1: request 3 once the button page closes; screen 1 is the save point
-   menu, which 1.9-test opened by mistake), minus the button page: backing out of
-   Load goes to screen 9 as usual, so the pause buttons appear and Continue resumes. */
-static void SMM_GAME_ABI smm_on_pause_setup(void)
+/* exe+31D499, in the pause's screen task (exe+31D3C0): the setup (exe+31D200) wrote current
+   screen = 9 (button page) and request = -1; the task has just built the button page (its first
+   block, only when the screen is 9) and is about to run the first screen. Make that the load
+   screen (3). It is the same switch the Load Game button makes (function 1: request 3 once the
+   button page closes), minus showing the button page first: backing out of Load goes to screen 9
+   as usual, with its objects built, so the pause buttons appear and Continue resumes.
+   Every pause start runs this, so it also tells the custom pause that it has started. */
+static void SMM_GAME_ABI smm_on_pause_task(void)
 {
     INT16 cur;
     /* Our pause has started: the restore can run on the first main-loop pass after it closes,
@@ -1818,19 +1822,20 @@ static void smm_install_hooks(void)
     /* Story flags (Journal button) and the remote shop. */
     g_shop_ok = smm_resolve_shop();
     if (g_cfg.shop_on && !g_shop_ok) g_cfg.shop_on = 0;
-    /* A hook at the end of the pause's setup: LoadMenu needs it (Load Game as the first screen);
-       the custom pause uses it to see that its pause started (prompt restore). */
+    /* A hook in the pause's screen task, after it built the button page: LoadMenu needs it (Load
+       Game as the first screen); the custom pause uses it to see that its pause started. The
+       task must test "screen == 9" before the site (the button page block) and "screen == 4"
+       right after it, both on the pause screen word. */
     g_setup_hook = 0;
     if (g_cfg.load_on || g_cfg.pause_on) {
-        static const BYTE site[5] = { 0x48, 0x8B, 0x5C, 0x24, 0x50 };      /* mov rbx,[rsp+50h] */
         DWORD f = g_targets[T_PAUSESETUP].found;
         if (!g_pause_ok) smm_log("Load menu unavailable: needs the custom pause code.");
-        else if (g_targets[T_PAUSESETUP].count != 1) smm_log("Pause setup hook unavailable (Load menu off): the pause setup code was not found.");
-        else if (memcmp(g_base + f + 0x2D, site, 5) != 0) smm_log("Pause setup hook unavailable (Load menu off): unexpected bytes at the hook site.");
-        else if (g_base[f - 0x81] != 0x66 || g_base[f - 0x80] != 0x89 || g_base[f - 0x7F] != 0x05 ||
-                 smm_rip(f - 0x81, 3, 7) != g_screen_cur)
-            smm_log("Pause setup hook unavailable (Load menu off): exe+%06X is not the setup that writes the pause screen.", f);
-        else g_setup_hook = f + 0x2D;
+        else if (g_targets[T_PAUSESETUP].count != 1) smm_log("Pause task hook unavailable (Load menu off): the pause screen task was not found.");
+        else if (smm_rip(f + 0x14, 3, 8) != g_screen_cur ||
+                 g_base[f - 0xAB] != 0x66 || g_base[f - 0xAA] != 0x83 || g_base[f - 0xA9] != 0x3D || g_base[f - 0xA4] != 0x09 ||
+                 smm_rip(f - 0xAB, 3, 8) != g_screen_cur)
+            smm_log("Pause task hook unavailable (Load menu off): exe+%06X is not the pause screen task we know.", f);
+        else g_setup_hook = f;
         if (!g_setup_hook) g_cfg.load_on = 0;
         else memcpy(setup_orig, g_base + g_setup_hook, 5);
     }
@@ -1851,7 +1856,7 @@ static void smm_install_hooks(void)
     lens[H_LOOP] = cave_loop(g_hooks[H_LOOP].cave, (const void *)(UINT_PTR)smm_on_frame, orig[H_LOOP],
                              S + SMM_LOOP_BACK);
     if (g_setup_hook)
-        setup_len = cave_setup(block + 0x300, (const void *)(UINT_PTR)smm_on_pause_setup, setup_orig,
+        setup_len = cave_setup(block + 0x300, (const void *)(UINT_PTR)smm_on_pause_task, setup_orig,
                                g_base + g_setup_hook + 5);
     /* Remote shop "Last": a hook at OpenShop's entry remembers the moogles the player talks to. */
     g_openshop_hook = 0;
@@ -1888,9 +1893,9 @@ static void smm_install_hooks(void)
     /* Optional: the Load menu's hook. If it cannot be written only the Load menu is off. */
     if (g_setup_hook) {
         if (smm_write_jump(g_base + g_setup_hook, block + 0x300))
-            smm_log("PATCHED: %-22s exe+%06X -> cave %p (%d bytes)", "pause setup", g_setup_hook, block + 0x300, setup_len);
+            smm_log("PATCHED: %-22s exe+%06X -> cave %p (%d bytes)", "pause screen task", g_setup_hook, block + 0x300, setup_len);
         else {
-            smm_log("Pause setup hook unavailable (Load menu off): could not write it.");
+            smm_log("Pause task hook unavailable (Load menu off): could not write it.");
             g_setup_hook = 0;
             g_cfg.load_on = 0;
         }

@@ -98,7 +98,7 @@ int main(int argc, char **argv)
     check(g_shop_table == 0xBEE968, "shop table pointer = exe+BEE968");
     check(g_shop_var == 0x716B50, "shop id variable = exe+716B50");
     check(g_shop_ok && g_open_shop == (SmmShopFn)(g_img + 0x1518E0), "OpenShop = exe+1518E0");
-    check(g_setup_hook == 0x31D34D && g_img[0x31D34D] == 0xE9, "pause setup hook written at exe+31D34D");
+    check(g_setup_hook == 0x31D499 && g_img[0x31D499] == 0xE9, "pause screen task hook written at exe+31D499 (after the button page is built)");
     check(g_img[0x157304] == 0xE9 && g_img[0x157312] == 0xE9 && g_img[0x15732A] == 0xE9, "three main hooks written");
     check(g_cfg.load_on && g_cfg.shop_on && g_cfg.save_on && g_cfg.pause_on, "all keybind features on with defaults");
 
@@ -125,27 +125,25 @@ int main(int argc, char **argv)
         check(smm_data_guard() && g_delta == 0 && g_slot3 == 0x2A11560, "data guard back on the real layout");
     }
 
-    /* --- Load menu: run the real hook through a copy of the setup's own prologue + the patched tail */
+    /* --- Load menu: run the real hook at exe+31D499 (the pause screen task, after the button page
+       is built). The cave runs mov edx,1 and jumps back to exe+31D49E; a ret placed there for the
+       test returns to us. */
     {
-        /* mov [rsp+8],rbx; mov [rsp+10h],rsi; push rdi; sub rsp,40h; jmp exe+31D34D */
-        BYTE *t = g_img + 0x2D90000;
-        static const BYTE pro[] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x40 };
-        INT32 rel;
-        memcpy(t, pro, sizeof(pro));
-        t[sizeof(pro)] = 0xE9;
-        rel = (INT32)((g_img + 0x31D34D) - (t + sizeof(pro) + 5));
-        memcpy(t + sizeof(pro) + 1, &rel, 4);
+        void (*t)(void) = (void (*)(void))(g_img + 0x31D499);
+        BYTE keep = g_img[0x31D49E];
+        g_img[0x31D49E] = 0xC3;
         w16(0x744C10, 9); w16(0x744C14, 0xFFFF);
         g_load_pending = 0;
         ((void (*)(void))t)();
-        check(r16(0x744C10) == 9 && r16(0x744C14) == 0xFFFF, "setup hook, no Load pending: pause starts on the button page (9)");
+        check(r16(0x744C10) == 9 && r16(0x744C14) == 0xFFFF, "task hook, no Load pending: pause starts on the button page (9)");
         g_load_pending = 1;
         ((void (*)(void))t)();
-        check(r16(0x744C10) == 3 && r16(0x744C14) == 0xFFFF && !g_load_pending, "setup hook, Load pending: pause starts on the load screen (3), request untouched");
+        check(r16(0x744C10) == 3 && r16(0x744C14) == 0xFFFF && !g_load_pending, "task hook, Load pending: pause starts on the load screen (3), request untouched");
         w16(0x744C10, 3); g_load_pending = 1;
         ((void (*)(void))t)();
-        check(r16(0x744C10) == 3 && !g_load_pending, "setup hook, unexpected screen: left alone");
+        check(r16(0x744C10) == 3 && !g_load_pending, "task hook, unexpected screen: left alone");
         w16(0x744C10, 0xFFFF);
+        g_img[0x31D49E] = keep;
     }
 
     /* --- remote shop with a stand-in OpenShop and a stand-in shop table */
@@ -310,7 +308,7 @@ int main(int argc, char **argv)
     /* --- 1.9.1: the pause-setup hook tells the custom pause that it started (prompt restore) */
     {
         g_load_pending = 0; g_pause_phase = 1; g_pause_frames = 50;
-        smm_on_pause_setup();
+        smm_on_pause_task();
         check(g_pause_phase == 2 && g_pause_frames == 0, "pause setup seen: custom pause waits for the close, not the timeout");
         g_pause_slot = g_slot3; smm_pause_fill();
         w16(g_screen_cur, 0xFFFF);
