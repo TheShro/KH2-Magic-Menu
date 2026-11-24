@@ -42,7 +42,7 @@ affected setting keeps its default.
 | `[RemoteShop] ShopId` | `Last` | `Last` = the last moogle you talked to (kept in `ShroMagicMenu-lastshop.txt`; the Hollow Bastion moogle, 0x13, until you have talked to one), or a shop id such as `0x13`. The log lists every shop id the first time the keybind is used |
 | `[RemoteShop] VisitedOnly` | 1 | Only shops whose unlock flag is set in the save (you have met that shopkeeper) |
 | `[RemoteShop] StandInSize` | 50 | Sora's size in the shop window, in percent (10 to 100); he stands in for the shopkeeper and is much bigger than a moogle. Set through the shop view's own scale (exe+2FECD0 hook), only while the remote shop is open. |
-| `[RemoteShop] StandInLift` | 70 | How far Sora is raised in the shop window, in game units (-300 to 300), so he sits centred instead of with his feet cut off. |
+| `[RemoteShop] StandInLift` | 30 | How far Sora is raised in the shop window, in game units (-300 to 300), so he sits centred instead of with his feet cut off. |
 | `[PartyMenu] InBattle` | 1 | Start in battle opens the party menu instead of the battle pause |
 | `[PartyMenu] InMissions` | 1 | The same in mission battles that have their own pause (outside cutscenes) |
 | `[Log] Enabled` | 1 | Write ShroMagicMenu.log |

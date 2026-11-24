@@ -357,17 +357,19 @@ int main(int argc, char **argv)
         stub[n++] = 0x41; stub[n++] = 0xBF; n += 4;                                 /* mov r15d,keeper (set below) */
         stub[n++] = 0xE8; rel = (INT32)((g_img + 0x2FECD0) - (stub + n + 4)); memcpy(stub + n, &rel, 4); n += 4;
         stub[n++] = 0x41; stub[n++] = 0x5F; stub[n++] = 0x5E; stub[n++] = 0xC3;   /* pop r15; pop rsi; ret */
-#define RUN_VIEW(k) do { int i_; for (i_ = 0; i_ < 4; i_++) { view[8 + i_] = 1.0f; view[i_] = 0.0f; } keeper = (k); memcpy(stub + 15, &keeper, 4); ((void (*)(void))stub)(); } while (0)
-        g_cfg.shop_standin_size = 50; g_cfg.shop_standin_lift = 70;
+        /* the view as the game just set it: rotation (0,0,0,0), position (0,0,0,1), scale (1,1,1,1) */
+#define RUN_VIEW(k) do { int i_; for (i_ = 0; i_ < 4; i_++) { view[i_] = 0.0f; view[4 + i_] = i_ == 3 ? 1.0f : 0.0f; view[8 + i_] = 1.0f; } \
+                         keeper = (k); memcpy(stub + 15, &keeper, 4); ((void (*)(void))stub)(); } while (0)
+        g_cfg.shop_standin_size = 50; g_cfg.shop_standin_lift = 30;
         g_keeper_swapped = dummy;
         RUN_VIEW(0x20000236);
-        check(view[8] == 0.5f && view[9] == 0.5f && view[10] == 0.5f && view[11] == 1.0f && view[1] == -70.0f && view[0] == 0.0f,
-              "remote shop, Sora standing in: shown at 50%, raised by 70 (Y up is negative)");
+        check(view[8] == 0.5f && view[9] == 0.5f && view[10] == 0.5f && view[11] == 1.0f && view[5] == -30.0f && view[4] == 0.0f &&
+              view[7] == 1.0f && view[1] == 0.0f, "remote shop, Sora standing in: shown at 50%, position Y raised by 30 (up is -Y)");
         RUN_VIEW(0x20000487);
-        check(view[8] == 1.0f && view[1] == 0.0f, "a moogle in the view: left as it is");
+        check(view[8] == 1.0f && view[5] == 0.0f, "a moogle in the view: left as it is");
         g_keeper_swapped = NULL;
         RUN_VIEW(0x20000236);
-        check(view[8] == 1.0f && view[1] == 0.0f, "no stand-in (not our shop): left as it is");
+        check(view[8] == 1.0f && view[5] == 0.0f, "no stand-in (not our shop): left as it is");
 #undef RUN_VIEW
         g_img[0x166850] = keep1; g_img[0x2FECD5] = keep2;
         memcpy(g_ini_text, ini, sizeof(ini));

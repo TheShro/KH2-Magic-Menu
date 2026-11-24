@@ -140,7 +140,7 @@ static const SmmConfig SMM_DEFAULTS = {
     1,                                 /* only shops the story has already unlocked */
     0,                                 /* no saving during a battle */
     50,                                /* Sora at 50% in the remote shop */
-    70                                 /* ... raised by 70 units */
+    30                                 /* ... raised by 30 units */
 };
 static SmmConfig g_cfg;
 
@@ -203,7 +203,7 @@ static const char SMM_DEFAULT_INI[] =
 "; Sora's size in the shop window, in percent (Sora is much bigger than a moogle): 10 to 100.\r\n"
 "StandInSize = 50\r\n"
 "; How far Sora is raised in the shop window, in game units (-300 to 300; negative = lower).\r\n"
-"StandInLift = 70\r\n"
+"StandInLift = 30\r\n"
 "\r\n"
 "[PartyMenu]\r\n"
 "; Start in battle opens the party menu instead of the battle pause.\r\n"
@@ -1064,22 +1064,28 @@ static int smm_is_moogle(WORD keeper) { return keeper == 0x487 || keeper == 0x50
 /* exe+2FECD0, in the shop's 3D view setup, right after it set the view's scale to 1.0: while
    our remote shop has Sora standing in (and this view is that stand-in), shrink him to
    StandInSize percent and raise him by StandInLift. Sora is far bigger than a moogle and
-   overfills the shop window with his feet cut off. The view: +0 position (just set to 0; KH2's
-   Y axis points down, so up is -Y), +0x10 rotation, +0x20 scale. It belongs to the shop and goes
-   with it, so nothing needs putting back. */
+   overfills the shop window with his feet cut off. The view (all just set by the game):
+   +0 rotation (0,0,0,0), +0x10 position (0,0,0,1), +0x20 scale (1,1,1,1). KH2's Y axis points
+   down (the shop camera's up vector is (0,-1,0)), so up is -Y. (1.9.1-test: writing +4 did
+   nothing; that is the rotation.) It belongs to the shop and goes with it, so nothing needs
+   putting back. */
 static DWORD g_shopview_hook = 0;      /* exe+2FECD0, 0 = not hooked */
 static void SMM_GAME_ABI smm_on_shop_view(BYTE *view, DWORD keeper)
 {
-    float s[3], one, y;
+    float s[3], one, y, w;
     int k;
     if (!g_keeper_swapped || keeper != (SMM_OBJ_PLAYER | SMM_KEEPER_FLAG)) return;
     memcpy(&one, view + 0x20, 4);
-    memcpy(&y, view + 4, 4);
-    if (one != 1.0f || y != 0.0f) { smm_log("Shop view: scale %g / height %g, not 1 / 0; Sora left as he is", (double)one, (double)y); return; }
+    memcpy(&y, view + 0x14, 4);
+    memcpy(&w, view + 0x1C, 4);
+    if (one != 1.0f || y != 0.0f || w != 1.0f) {
+        smm_log("Shop view: scale %g / height %g / w %g, not 1 / 0 / 1; Sora left as he is", (double)one, (double)y, (double)w);
+        return;
+    }
     for (k = 0; k < 3; k++) s[k] = (float)g_cfg.shop_standin_size / 100.0f;
     memcpy(view + 0x20, s, sizeof(s));
     y = (float)-g_cfg.shop_standin_lift;
-    memcpy(view + 4, &y, 4);
+    memcpy(view + 0x14, &y, 4);
     smm_logv("Shop view: Sora at %d%%, raised by %d", g_cfg.shop_standin_size, g_cfg.shop_standin_lift);
 }
 
