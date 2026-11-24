@@ -29,6 +29,8 @@
  *      met that shopkeeper). Not the reaction-command route: running a reaction command needs
  *      the target object it belongs to (e.g. the moogle), and without one the game crashes.
  *   The Journal button is only offered once the story has unlocked Jiminy's Journal (flag 0x73).
+ *   No saving during a battle (the Save keybind and the custom pause's Save button) unless
+ *   SaveInBattle = 1: a save made mid-fight can load into a broken state.
  *   Keybinds are shoulder buttons plus Start, or shoulder buttons plus a D-pad direction. A D-pad
  *   bind only fires when the game's own "may Start pause now?" checks (the five tests in front of
  *   the Start code) pass, so it behaves like Start would.
@@ -42,7 +44,10 @@
  *     exe+15732A  xor edx,edx / mov rcx  -> once per loop: party menu flag, D-pad keybinds,
  *                                           custom pause tidy-up, state logging
  *   All hooks are written once in DllMain, before the game loop runs, and only if every site
- *   matches. Otherwise nothing is patched and the log says why. Optional parts (custom pause,
+ *   matches. Otherwise nothing is patched and the log says why. Data the code cannot find on its
+ *   own (controller, world, battle state, cutscene flags, KSX's tables) is checked by the data
+ *   guard: every data address the code does name must match our notes or have moved by one
+ *   common amount (then the rest moves with it); otherwise nothing is patched. Optional parts (custom pause,
  *   D-pad binds, ForceWorldTravel) are switched off on their own if their code looks different.
  *
  * Log: ShroMagicMenu.log next to the game exe.
@@ -56,19 +61,28 @@
 #include <stdarg.h>
 #include <string.h>
 
-#define SMM_VERSION "1.9"
+#define SMM_VERSION "1.9.1"
 
 /* ---------------------------------------------------------------- data addresses (Steam Global) */
-#define SMM_SHOULDERS     0x7133EB   /* controller: L2=01 R2=02 L1=04 R1=08 (+face buttons above) */
-#define SMM_DPAD          0x7133EA   /* controller: Start=08 Up=10 Right=20 Down=40 Left=80 */
-#define SMM_MENU_BLOCK    0x2A114E0  /* battle pause slot's active byte: blocks the party menu */
-#define SMM_WORLD         0x717008   /* Now+0x00, world id; 0x0F = World Map */
+/* Data the code cannot find on its own is listed at its v1.0.0.7 address and read through DA(),
+   which adds the shift the data guard measured (smm_data_guard: every data address the code CAN
+   find must agree on one shift, else nothing is patched). 0 on the known build. */
+static INT64 g_delta = 0;
+static DWORD g_slot3 = 0;                    /* pause slot 3 (exe+2A11560), derived from the Start code */
+#define DA(x) ((DWORD)((INT64)(x) + g_delta))
+#define SMM_SHOULDERS     DA(0x7133EB)   /* controller: L2=01 R2=02 L1=04 R1=08 (+face buttons above) */
+#define SMM_DPAD          DA(0x7133EA)   /* controller: Start=08 Up=10 Right=20 Down=40 Left=80 */
+#define SMM_MENU_BLOCK    0x2A114E0      /* notes only: battle pause slot 1 (derived: g_slot1) */
+#define SMM_WORLD         DA(0x717008)   /* Now+0x00, world id; 0x0F = World Map */
 #define SMM_WORLD_MAP     0x0F
-#define SMM_BTLTYP        0x2A11404  /* battle status: 0 none, 1 regular, 2 forced (GoA) */
-#define SMM_CUT_FLAGS     0xABB854   /* bit 0x04 set in cutscenes */
-#define SMM_CUT_PAUSE     0x2A115A0  /* non-zero only in cutscenes */
-#define SMM_PAUSE_BLOCK   0x2A11562  /* slot 3 options: count, then (function, text) */
+#define SMM_BTLTYP        DA(0x2A11404)  /* battle status: 0 none, 1 regular, 2 forced (GoA) */
+#define SMM_CUT_FLAGS     DA(0xABB854)   /* bit 0x04 set in cutscenes */
+#define SMM_CUT_PAUSE     (g_slot3 + 0x40) /* pause slot 4 (cutscenes): non-zero only in cutscenes */
+#define SMM_PAUSE_BLOCK   (g_slot3 + 2)  /* slot 3 options: count, then (function, text) */
 #define SMM_SAVE_MENU     3
+/* The exe this module was written against (v1.0.0.7 Steam Global): PE header values. */
+#define SMM_KNOWN_STAMP   0x669E384Au
+#define SMM_KNOWN_SIZE    0x2C2B000u
 
 /* Hook sites, relative to the StartCheck signature match. */
 #define SMM_SPECIAL_OFF   0x0B       /* 48 85 C0 75 17 : test rax,rax / jne mission */
@@ -108,6 +122,9 @@ typedef struct {
     int shop_on;  SmmBind shop_bind;
     int shop_id;
     int shop_visited_only;
+    int save_in_battle;
+    int shop_standin_size;            /* percent: Sora's size in the remote shop's 3D view */
+    int shop_standin_lift;            /* menu screen units: how far that view's centre is raised */
 } SmmConfig;
 static const SmmConfig SMM_DEFAULTS = {
     1, { 0x08, SMM_TRIG_START },       /* save menu: R1 + Start */
@@ -120,7 +137,10 @@ static const SmmConfig SMM_DEFAULTS = {
     1, { 0x04, SMM_TRIG_START },       /* load menu: L1 + Start */
     1, { 0x01, SMM_TRIG_START },       /* remote shop: L2 + Start */
     -1,                                /* shop: the last moogle used (Last), else 0x13 */
-    1                                  /* only shops the story has already unlocked */
+    1,                                 /* only shops the story has already unlocked */
+    0,                                 /* no saving during a battle */
+    40,                                /* Sora at 40% in the remote shop (Adam's tuning) */
+    120                                /* ... raised by 120 screen units */
 };
 static SmmConfig g_cfg;
 
@@ -140,6 +160,11 @@ static const char SMM_DEFAULT_INI[] =
 "; Opens the save point menu straight away.\r\n"
 "Enabled = 1\r\n"
 "Keybind = R1+Start\r\n"
+"; Allow saving during a battle: this keybind and the custom pause's Save button.\r\n"
+"; WARNING: a save made in the middle of a battle (above all a boss fight or a mission) may load\r\n"
+"; into a broken state or softlock your game. If you turn this on, keep a separate save from\r\n"
+"; before the fight.\r\n"
+"SaveInBattle = 0\r\n"
 "\r\n"
 "[CustomPause]\r\n"
 "; Pause with Save / Load Game / Jiminy's Journal / Continue. Not available on the World Map.\r\n"
@@ -170,11 +195,16 @@ static const char SMM_DEFAULT_INI[] =
 "; Which shop: Last = the last moogle you talked to (remembered between sessions; the\r\n"
 "; Hollow Bastion moogle until you have talked to one), or a shop id (hex like 0x13).\r\n"
 "; The log lists every shop the game knows the first time you use the keybind.\r\n"
-"; Away from the shopkeeper, Sora stands in for them in the shop (the game can only show a\r\n"
-"; shopkeeper whose model is loaded where you are).\r\n"
+"; Sora stands in for the shopkeeper in the shop (the game can only show a shopkeeper whose\r\n"
+"; model is loaded, and Sora's always is).\r\n"
 "ShopId = Last\r\n"
 "; 1 = only shops the story has already unlocked (you have met that shopkeeper).\r\n"
 "VisitedOnly = 1\r\n"
+"; Sora's size in the shop window, in percent (Sora is much bigger than a moogle): 10 to 100.\r\n"
+"StandInSize = 40\r\n"
+"; How far Sora is raised in the shop window, in the menu's screen units (the menu screen is\r\n"
+"; about 448 high; -300 to 300; negative = lower).\r\n"
+"StandInLift = 120\r\n"
 "\r\n"
 "[PartyMenu]\r\n"
 "; Start in battle opens the party menu instead of the battle pause.\r\n"
@@ -208,8 +238,9 @@ static void smm_log(const char *fmt, ...)
     _vsnprintf_s(buf + n, sizeof(buf) - n, _TRUNCATE, fmt, ap);
     va_end(ap);
     strcat_s(buf, sizeof(buf), "\r\n");
+    /* No FlushFileBuffers: what WriteFile has taken survives a game crash, and a disk flush per
+       line runs on the game thread inside the hooks, where it can hitch a frame. */
     WriteFile(g_log, buf, (DWORD)strlen(buf), &written, NULL);
-    FlushFileBuffers(g_log);
 }
 #define smm_logv(...) do { if (g_cfg.log_verbose) smm_log(__VA_ARGS__); } while (0)
 
@@ -238,7 +269,7 @@ static void smm_open_log(void)
 /* ---------------------------------------------------------------- ini */
 #define SMM_INI_MAX 16384
 static char g_ini_text[SMM_INI_MAX + 1];
-static int g_ini_state = 0;          /* 0 read, 1 missing -> default written, 2 missing, could not write, 3 too big/unreadable */
+static int g_ini_state = 0;          /* 0 read, 1 missing -> default written, 2 missing, could not write, 3 too big/unreadable, 4 UTF-16 */
 
 static void smm_read_ini(void)
 {
@@ -247,12 +278,21 @@ static void smm_read_ini(void)
     DWORD got = 0;
 
     g_ini_text[0] = 0;
+    g_ini_state = 0;
     if (!smm_game_path(path, L"ShroMagicMenu.ini")) { g_ini_state = 3; return; }
     h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         if (!ReadFile(h, g_ini_text, SMM_INI_MAX, &got, NULL)) got = 0;
         g_ini_text[got] = 0;
         if (got == SMM_INI_MAX) { g_ini_state = 3; g_ini_text[0] = 0; }   /* far too big for ours */
+        /* Notepad's "Unicode" (UTF-16): every other byte is 0, so no line would parse. */
+        else if (got >= 2 && (((BYTE)g_ini_text[0] == 0xFF && (BYTE)g_ini_text[1] == 0xFE) ||
+                              ((BYTE)g_ini_text[0] == 0xFE && (BYTE)g_ini_text[1] == 0xFF) || g_ini_text[1] == 0)) {
+            g_ini_state = 4; g_ini_text[0] = 0;
+        }
+        /* UTF-8 with a byte order mark (Notepad's "UTF-8 with BOM"): drop the mark. */
+        else if (got >= 3 && (BYTE)g_ini_text[0] == 0xEF && (BYTE)g_ini_text[1] == 0xBB && (BYTE)g_ini_text[2] == 0xBF)
+            memmove(g_ini_text, g_ini_text + 3, got - 3 + 1);
         CloseHandle(h);
         return;
     }
@@ -410,9 +450,20 @@ static int smm_load_settings(int quiet)
                 else if (smm_ieq(key, "Keybind")) bind = &g_cfg.shop_bind;
                 else if (smm_ieq(key, "ShopId")) { if (smm_ieq(val, "Last")) { g_cfg.shop_id = -1; continue; } num = &g_cfg.shop_id; }
                 else if (smm_ieq(key, "VisitedOnly")) flag = &g_cfg.shop_visited_only;
+                else if (smm_ieq(key, "StandInSize")) num = &g_cfg.shop_standin_size;
+                else if (smm_ieq(key, "StandInLift")) {      /* may be negative */
+                    int v, neg = val[0] == '-';
+                    if (smm_parse_num(val + neg, &v) && v <= 300) g_cfg.shop_standin_lift = neg ? -v : v;
+                    else {
+                        if (!quiet) smm_log("Settings: [RemoteShop] StandInLift = \"%s\" is not a number from -300 to 300, default kept", val);
+                        problems++;
+                    }
+                    continue;
+                }
             } else if (smm_ieq(section, "SaveMenu")) {
                 if (smm_ieq(key, "Enabled")) flag = &g_cfg.save_on;
                 else if (smm_ieq(key, "Keybind")) bind = &g_cfg.save_bind;
+                else if (smm_ieq(key, "SaveInBattle")) flag = &g_cfg.save_in_battle;
             } else if (smm_ieq(section, "CustomPause")) {
                 if (smm_ieq(key, "Enabled")) flag = &g_cfg.pause_on;
                 else if (smm_ieq(key, "Keybind")) bind = &g_cfg.pause_bind;
@@ -452,6 +503,11 @@ static int smm_load_settings(int quiet)
                 problems++;
             }
         }
+    }
+    if (g_cfg.shop_standin_size < 10 || g_cfg.shop_standin_size > 100) {
+        if (!quiet) smm_log("Settings: [RemoteShop] StandInSize = %d is not 10 to 100, 40 used", g_cfg.shop_standin_size);
+        g_cfg.shop_standin_size = 40;
+        problems++;
     }
     /* A keybind of None switches its feature off. */
     if (!g_cfg.save_bind.trig) g_cfg.save_on = 0;
@@ -530,12 +586,14 @@ static SmmTarget g_targets[] = {
     { "ShopTable",
       "4C 8B 3D ?? ?? ?? ?? 44 8B C6 45 0F BF 4F 06 49 8D 5F 10 45 85 C9 0F 8E",
       0x2FBA5E, 0, 0 },
-    /* LoadMenu only: end of the pause's setup (exe+31D200), right after it starts the pause's
-       screen task; the setup has just written current screen = 9 (button page), request = -1. */
-    { "PauseSetupEnd",
-      "C7 44 24 30 8C 00 00 00 48 89 4C 24 28 4C 8D 0D ?? ?? ?? ?? 33 D2 C7 44 24 20 00 10 00 00 "
-      "48 8B 48 08 41 B8 CE 07 00 00 E8 ?? ?? ?? ?? 48 8B 5C 24 50 48 8B 74 24 58 48 83 C4 40 5F C3",
-      0x31D320, 0, 0 },
+    /* LoadMenu: the pause's screen task (exe+31D3C0), once it has built the button page (its first
+       block runs only when the current screen is 9) and before it runs the first screen:
+       mov edx,1 / mov [flag],sil / mov rcx,rbx / call / cmp word [screen],4 / jne.
+       (1.9 switched the screen at the end of the setup, before the task ran, so the button page
+       was never built: backing out of Load then used stale objects and crashed.) */
+    { "PauseScreenTask",
+      "BA 01 00 00 00 40 88 35 ?? ?? ?? ?? 48 8B CB E8 ?? ?? ?? ?? 66 83 3D ?? ?? ?? ?? 04 75",
+      0x31D499, 0, 0 },
     /* RemoteShop only: the shop's 3D shopkeeper setup (exe+3E6120): model path from the object
        entry, then the model cache. The shop can only show a model that is already loaded. */
     { "ShopKeeperModel",
@@ -545,10 +603,22 @@ static SmmTarget g_targets[] = {
     { "ShopKeeperEntry",
       "48 85 FF 75 0A 8B CE E8 ?? ?? ?? ?? 48 8B F8 48 8B D7 8B CE E8",
       0x3E6428, 0, 0 },
+    /* Data guard only: the game's raw pad lookup GetPad(n) = exe+BF3270 + n*0x58, the controller
+       state KSX's scripts read (same bits as our exe+7133EA / 7133EB). */
+    { "GetPad",
+      "48 63 C1 48 8D 0D ?? ?? ?? ?? 48 6B C0 58 48 03 C1 C3",
+      0x39B760, 0, 0 },
+    /* RemoteShop only: the shop's 3D shopkeeper view setup (exe+2FEB20, view object in rsi,
+       shopkeeper | 0x20000000 in r15d) sets the view's scale vector [rsi+20h] from four 1.0f
+       (movaps xmm0,[rip] / lea rcx,[rsi+20h] / ... / call / call). Hook site: the second call. */
+    { "ShopViewScale",
+      "0F 28 05 ?? ?? ?? ?? 48 8D 4E 20 48 8D 54 24 60 0F 11 44 24 60 E8 ?? ?? ?? ?? E8",
+      0x2FECB6, 0, 0 },
 };
 #define SMM_TARGET_COUNT (sizeof(g_targets) / sizeof(g_targets[0]))
 enum { T_OPENMENU = 0, T_STARTCHECK = 1, T_PAUSESELECT = 2, T_PAUSETAIL = 3, T_BUTTONS = 4, T_SAVEMODE = 5,
-       T_OPENSHOP = 6, T_SHOPTABLE = 7, T_PAUSESETUP = 8, T_KEEPERMODEL = 9, T_KEEPERENTRY = 10 };
+       T_OPENSHOP = 6, T_SHOPTABLE = 7, T_PAUSESETUP = 8, T_KEEPERMODEL = 9, T_KEEPERENTRY = 10, T_GETPAD = 11,
+       T_SHOPVIEW = 12 };
 
 #define SMM_MAX_SIG 128
 
@@ -573,21 +643,65 @@ static int smm_parse_sig(const char *text, BYTE *bytes, BYTE *mask)
 }
 
 static BYTE *g_base = NULL;
+static int g_known_build = 0;          /* 1 = the PE header matches v1.0.0.7 Steam Global */
+static DWORD g_code_lo = 0, g_code_hi = 0;   /* executable sections, for the crash report */
+
+/* The exe's PE header, or NULL. */
+static IMAGE_NT_HEADERS64 *smm_nt(void)
+{
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)g_base;
+    IMAGE_NT_HEADERS64 *nt;
+    if (!g_base || dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+    nt = (IMAGE_NT_HEADERS64 *)(g_base + dos->e_lfanew);
+    return nt->Signature == IMAGE_NT_SIGNATURE ? nt : NULL;
+}
+
+/* Log which exe this is and note the executable range. Known build = the signatures are first
+   checked at the offsets in our notes (all proven unique on this build by the tests). */
+static void smm_identify_build(void)
+{
+    IMAGE_NT_HEADERS64 *nt = smm_nt();
+    IMAGE_SECTION_HEADER *sec;
+    WORD i;
+    if (!nt) return;
+    g_known_build = nt->FileHeader.TimeDateStamp == SMM_KNOWN_STAMP && nt->OptionalHeader.SizeOfImage == SMM_KNOWN_SIZE;
+    sec = IMAGE_FIRST_SECTION(nt);
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
+        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        if (!g_code_lo || sec->VirtualAddress < g_code_lo) g_code_lo = sec->VirtualAddress;
+        if (sec->VirtualAddress + sec->Misc.VirtualSize > g_code_hi) g_code_hi = sec->VirtualAddress + sec->Misc.VirtualSize;
+    }
+    smm_log("Game exe: build stamp %08X, image size %X%s", nt->FileHeader.TimeDateStamp, nt->OptionalHeader.SizeOfImage,
+            g_known_build ? " (v1.0.0.7 Steam Global, the build our notes are from)" : " (NOT the build our notes are from: full scan)");
+}
+
+static int smm_match_at(const BYTE *p, const BYTE *bytes, const BYTE *mask, int len)
+{
+    int k;
+    for (k = 0; k < len; k++)
+        if (mask[k] && p[k] != bytes[k]) return 0;
+    return 1;
+}
 
 static void smm_scan_target(SmmTarget *t)
 {
     BYTE bytes[SMM_MAX_SIG], mask[SMM_MAX_SIG];
     int len = smm_parse_sig(t->sig, bytes, mask);
-    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)g_base;
-    IMAGE_NT_HEADERS64 *nt;
+    IMAGE_NT_HEADERS64 *nt = smm_nt();
     IMAGE_SECTION_HEADER *sec;
     WORD i;
 
     t->count = 0;
     t->found = 0;
-    if (len == 0 || dos->e_magic != IMAGE_DOS_SIGNATURE) return;
-    nt = (IMAGE_NT_HEADERS64 *)(g_base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    if (len == 0 || !nt) return;
+    /* Known build: the signature where our notes put it is enough (a full scan costs ~4 ms per
+       signature, inside DllMain). Anything else falls through to the full scan. */
+    if (g_known_build && t->expected && t->expected + len <= nt->OptionalHeader.SizeOfImage &&
+        smm_match_at(g_base + t->expected, bytes, mask, len)) {
+        t->found = t->expected;
+        t->count = 1;
+        return;
+    }
     sec = IMAGE_FIRST_SECTION(nt);
 
     for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
@@ -648,7 +762,6 @@ typedef void (SMM_GAME_ABI *SmmSpecialFn)(void *slot, void *arg);
 typedef void *(SMM_GAME_ABI *SmmPtrFn)(void);
 static SmmSpecialFn g_special_open = NULL;   /* the game's special-pause routine (exe+2E4C20) */
 static SmmPtrFn g_lookup = NULL;             /* the special-pause lookup (exe+3AD540): active slot or 0 */
-static DWORD g_slot3 = 0;                    /* pause slot 3 (exe+2A11560) */
 static DWORD g_pause_slot = 0;               /* the slot our pause uses this time: slot 3, or a free one */
 static DWORD g_slot1 = SMM_MENU_BLOCK;       /* pause slot 1, the battle pause (exe+2A114E0) */
 static DWORD g_screen_cur = 0;               /* word: the pause's current screen (-1 = no pause) */
@@ -656,7 +769,7 @@ static int g_pause_ok = 0;
 
 /* What the custom pause writes, mirroring KSX's "Save, Load, World Map Anywhere": the slot
    (KSX's layout), his second option table, the cutscene table and "loadingheart".
-   rel_slot = relative to the slot in use; the rest are Steam Global data addresses. */
+   rel_slot: 1 = relative to the slot in use, 2 = relative to slot 4, 0 = Steam Global data address. */
 typedef struct { int rel_slot; DWORD addr; BYTE size; DWORD value; } SmmWrite;
 static const SmmWrite PAUSE_WRITES[] = {
     { 1, 0x00, 1, 1 },                                       /* slot: active */
@@ -678,9 +791,9 @@ static const SmmWrite PAUSE_WRITES[] = {
     { 0, 0x2AB2760, 2, 0x0001 }, { 0, 0x2AB2762, 2, 0x8AAF },
     { 0, 0x2AB2764, 2, 0x0011 }, { 0, 0x2AB2766, 2, 0xC52C },
     { 0, 0x2AB2768, 2, 0x0004 }, { 0, 0x2AB276A, 2, 0x8AB2 },
-    { 0, 0x2A115A2, 2, 2 },                                  /* cutscene option table */
-    { 0, 0x2A115A4, 2, 0x0001 }, { 0, 0x2A115A6, 2, 0x8AAF },
-    { 0, 0x2A115A8, 2, 0x0011 }, { 0, 0x2A115AA, 2, 0xC52C },
+    { 2, 0x02, 2, 2 },                                       /* cutscene option table (slot 4, exe+2A115A2) */
+    { 2, 0x04, 2, 0x0001 }, { 2, 0x06, 2, 0x8AAF },
+    { 2, 0x08, 2, 0x0011 }, { 2, 0x0A, 2, 0xC52C },
     { 0, 0x8EC5B0, 4, 0x44960000 },                          /* "loadingheart" = 1200.0f (KSX writes it) */
 };
 #define PAUSE_WRITE_COUNT (sizeof(PAUSE_WRITES) / sizeof(PAUSE_WRITES[0]))
@@ -700,7 +813,12 @@ static int g_pause_frames = 0;
 #define SMM_FN_JOURNAL   0x000A
 #define SMM_FN_CONTINUE  0x0006
 
-static DWORD pw_addr(const SmmWrite *w) { return w->rel_slot ? g_pause_slot + w->addr : w->addr; }
+/* rel_slot 1 = the slot in use, 2 = slot 4 (cutscenes), 0 = a fixed data address (shifted by the
+   data guard's delta). */
+static DWORD pw_addr(const SmmWrite *w)
+{
+    return w->rel_slot == 1 ? g_pause_slot + w->addr : w->rel_slot == 2 ? g_slot3 + 0x40 + w->addr : DA(w->addr);
+}
 static DWORD pw_rd(const SmmWrite *w)
 {
     DWORD v = 0;
@@ -718,7 +836,8 @@ static void smm_pause_fill(void)
     unsigned i, n = 0;
     /* Shown in this order: Load Game, Save (as before 1.9). */
     if (g_cfg.show_load)    { pairs[n * 2] = SMM_FN_LOAD;    pairs[n * 2 + 1] = 0x8AAF; n++; }
-    if (g_cfg.show_save)    { pairs[n * 2] = SMM_FN_SAVE;    pairs[n * 2 + 1] = 0xC52C; n++; }
+    /* No Save during a battle unless SaveInBattle = 1. */
+    if (g_cfg.show_save && (g_cfg.save_in_battle || rd8(SMM_BTLTYP) == 0)) { pairs[n * 2] = SMM_FN_SAVE; pairs[n * 2 + 1] = 0xC52C; n++; }
     /* Jiminy's Journal only once the story has unlocked it (flag 0x73, Save+239E bit 8). */
     if (g_cfg.show_journal && smm_flag(SMM_FLAG_JOURNAL)) { pairs[n * 2] = SMM_FN_JOURNAL; pairs[n * 2 + 1] = 0x8AB7; n++; }
     pairs[n * 2] = SMM_FN_CONTINUE; pairs[n * 2 + 1] = 0x8AB4; n++;
@@ -943,6 +1062,43 @@ static void smm_write_last_shop(int id)
    0x50F (Hollow Bastion's). Seen in the shop table: these are the shops that offer synthesis. */
 static int smm_is_moogle(WORD keeper) { return keeper == 0x487 || keeper == 0x50F; }
 
+/* exe+2FECD0, in the shop's 3D view setup (exe+2FEB20), right after it set the view's scale to
+   1.0: while our remote shop has Sora standing in (and this view is that stand-in), shrink him
+   to StandInSize percent. Sora is far bigger than a moogle and overfills the shop window. The
+   view: +0 rotation, +0x10 position, +0x20 scale. (1.9.1-test: moving the view's position did
+   nothing; the shop places the model through its camera, see smm_on_shop_view_entry.) It belongs
+   to the shop and goes with it, so nothing needs putting back. */
+static DWORD g_shopview_hook = 0;      /* exe+2FECD0, 0 = not hooked */
+static DWORD g_shopentry_hook = 0;     /* exe+2FEB20, 0 = not hooked */
+static void SMM_GAME_ABI smm_on_shop_view(BYTE *view, DWORD keeper)
+{
+    float s[3], one;
+    int k;
+    if (!g_keeper_swapped || keeper != (SMM_OBJ_PLAYER | SMM_KEEPER_FLAG)) return;
+    memcpy(&one, view + 0x20, 4);
+    if (one != 1.0f) { smm_log("Shop view: scale %g, not 1; Sora left at full size", (double)one); return; }
+    for (k = 0; k < 3; k++) s[k] = (float)g_cfg.shop_standin_size / 100.0f;
+    memcpy(view + 0x20, s, sizeof(s));
+    smm_logv("Shop view: Sora at %d%%", g_cfg.shop_standin_size);
+}
+
+/* exe+2FEB20, entry of the shop's 3D view setup. Its 6th and 7th arguments (stack, [rsp+30h] and
+   [rsp+38h] at entry) are the view's screen centre x and y (from the shop layout; the setup adds
+   0x800 and hands them to the camera's projection, exe+19DC50). Raising the centre (smaller y)
+   raises Sora in the window. Only for the stand-in, only while our remote shop is open; the
+   arguments are the caller's copies, so nothing needs putting back. */
+static void SMM_GAME_ABI smm_on_shop_view_entry(BYTE *entry_rsp, DWORD keeper)
+{
+    INT32 x, y;
+    if (!g_keeper_swapped || keeper != (SMM_OBJ_PLAYER | SMM_KEEPER_FLAG)) return;
+    memcpy(&x, entry_rsp + 0x30, 4);
+    memcpy(&y, entry_rsp + 0x38, 4);
+    if (x < -2048 || x > 2048 || y < -2048 || y > 2048) { smm_log("Shop view: centre %d,%d looks wrong; Sora left where he is", x, y); return; }
+    smm_log("Shop view: centre %d,%d -> %d,%d (StandInLift %d)", x, y, x, y - g_cfg.shop_standin_lift, g_cfg.shop_standin_lift);
+    y -= g_cfg.shop_standin_lift;
+    memcpy(entry_rsp + 0x38, &y, 4);
+}
+
 static const BYTE *smm_shop_entry(int id, int *count);
 
 /* exe+1518E0, OpenShop(id): every shop the game opens, a shopkeeper's or ours. */
@@ -976,7 +1132,7 @@ static int smm_resolve_shop(void)
             g_flags, g_shop_table);
     if (g_targets[T_OPENSHOP].count != 1) { smm_log("Remote shop unavailable: OpenShop was not found."); return 0; }
     f = g_targets[T_OPENSHOP].found;
-    if (smm_rip(f + 0x11, 2, 7) != 0x716884) {
+    if (smm_rip(f + 0x11, 2, 7) != DA(0x716884)) {
         smm_log("Remote shop unavailable: OpenShop does not test menustate at exe+716884.");
         return 0;
     }
@@ -1094,8 +1250,14 @@ typedef void (SMM_GAME_ABI *SmmMenuFn)(int);
 static SmmMenuFn g_open_menu = NULL;     /* OpenMenu(id) */
 static SmmMenuFn g_menu_follow = NULL;   /* the call the pause code makes right after OpenMenu */
 
-static void smm_do_save(const char *how)
+/* 1 = opened. */
+static int smm_do_save(const char *how)
 {
+    if (smm_on_world_map()) { smm_logv("%s: not on the World Map", how); return 0; }
+    if (!g_cfg.save_in_battle && rd8(SMM_BTLTYP) != 0) {
+        smm_log("%s: no saving during a battle (SaveInBattle = 0)", how);
+        return 0;
+    }
     if (g_cfg.force_world && g_save_mode && rd32(g_save_mode) == 2) {
         DWORD three = 3;
         memcpy(g_base + g_save_mode, &three, 4);     /* the setter's own value with ForceWorldTravel */
@@ -1103,6 +1265,7 @@ static void smm_do_save(const char *how)
     smm_log("%s: opening the save point menu", how);
     g_open_menu(SMM_SAVE_MENU);
     g_menu_follow(SMM_SAVE_MENU);
+    return 1;
 }
 
 /* Verbose diagnostics: the game's pause state when the custom pause opens.
@@ -1115,12 +1278,13 @@ static void smm_log_pause_state(const char *what)
     unsigned i;
     static const DWORD objs[7] = { 0xBEF510, 0xBEF518, 0xBEF520, 0xBEF528, 0xBEF530, 0xBEF538, 0xBEF550 };
     UINT64 p88, p90, p98, pb0, pa0, pa8;
-    for (i = 0; i < 7; i++) memcpy(&q[i], g_base + objs[i], 8);
-    memcpy(&p88, g_base + 0xBEF488, 8); memcpy(&p90, g_base + 0xBEF490, 8); memcpy(&p98, g_base + 0xBEF498, 8);
-    memcpy(&pb0, g_base + 0xBEF4B0, 8); memcpy(&pa0, g_base + 0xBEF4A0, 8); memcpy(&pa8, g_base + 0xBEF4A8, 8);
+    for (i = 0; i < 7; i++) memcpy(&q[i], g_base + DA(objs[i]), 8);
+    memcpy(&p88, g_base + DA(0xBEF488), 8); memcpy(&p90, g_base + DA(0xBEF490), 8); memcpy(&p98, g_base + DA(0xBEF498), 8);
+    memcpy(&pb0, g_base + DA(0xBEF4B0), 8); memcpy(&pa0, g_base + DA(0xBEF4A0), 8); memcpy(&pa8, g_base + DA(0xBEF4A8), 8);
     smm_log("%s: screen %d req %d | BEF508-B %u %u %u %u | 9A8738 %u | 749830 %08X | menu-open %u cur %d | BtlTyp %u world %02X",
-            what, (int)(INT16)rd16(0x744C10), (int)(INT16)rd16(0x744C14), rd8(0xBEF508), rd8(0xBEF509), rd8(0xBEF50A), rd8(0xBEF50B),
-            rd8(0x9A8738), rd32(0x749830), rd8(0x9006B0), (int)rd32(0x900724), rd8(SMM_BTLTYP), rd8(SMM_WORLD));
+            what, (int)(INT16)rd16(g_screen_cur), (int)(INT16)rd16(g_screen_cur + 4), rd8(DA(0xBEF508)), rd8(DA(0xBEF509)),
+            rd8(DA(0xBEF50A)), rd8(DA(0xBEF50B)), rd8(DA(0x9A8738)), rd32(DA(0x749830)), rd8(DA(0x9006B0)), (int)rd32(DA(0x900724)),
+            rd8(SMM_BTLTYP), rd8(SMM_WORLD));
     smm_log("%s: slotptr %llX/%llX | pause objs 488 %llX 490 %llX 498 %llX 4B0 %llX", what,
             (unsigned long long)pa0, (unsigned long long)pa8, (unsigned long long)p88, (unsigned long long)p90,
             (unsigned long long)p98, (unsigned long long)pb0);
@@ -1155,10 +1319,10 @@ static int smm_slot_offers_retry(const BYTE *slot)
     return 0;
 }
 
-/* LoadMenu: set just before our pause opens; the pause-setup hook (smm_on_pause_setup) then
+/* LoadMenu: set just before our pause opens; the screen-task hook (smm_on_pause_task) then
    makes the Load Game screen the pause's first screen. */
 static int g_load_pending = 0;
-static DWORD g_setup_hook = 0;         /* exe+31D34D, 0 = LoadMenu unavailable */
+static DWORD g_setup_hook = 0;         /* exe+31D499 (pause screen task), 0 = LoadMenu unavailable */
 
 /* 1 = opened. load = open it on the Load Game screen. */
 static int smm_do_pause(const char *how, int load)
@@ -1226,15 +1390,19 @@ static void smm_pause_end(const char *why)
     g_pause_phase = 0;
 }
 
-/* exe+31D34D, end of the pause's setup (exe+31D200): current screen = 9 (button page) and
-   request = -1 were just written and the screen task started, which reads the current screen
-   when it first runs. Make that the load screen (3). It is the same switch the Load Game
-   button makes (function 1: request 3 once the button page closes; screen 1 is the save point
-   menu, which 1.9-test opened by mistake), minus the button page: backing out of
-   Load goes to screen 9 as usual, so the pause buttons appear and Continue resumes. */
-static void SMM_GAME_ABI smm_on_pause_setup(void)
+/* exe+31D499, in the pause's screen task (exe+31D3C0): the setup (exe+31D200) wrote current
+   screen = 9 (button page) and request = -1; the task has just built the button page (its first
+   block, only when the screen is 9) and is about to run the first screen. Make that the load
+   screen (3). It is the same switch the Load Game button makes (function 1: request 3 once the
+   button page closes), minus showing the button page first: backing out of Load goes to screen 9
+   as usual, with its objects built, so the pause buttons appear and Continue resumes.
+   Every pause start runs this, so it also tells the custom pause that it has started. */
+static void SMM_GAME_ABI smm_on_pause_task(void)
 {
     INT16 cur;
+    /* Our pause has started: the restore can run on the first main-loop pass after it closes,
+       instead of waiting for the phase-1 timeout (the main loop does not run while it is up). */
+    if (g_pause_phase == 1) { g_pause_phase = 2; g_pause_frames = 0; }
     if (!g_load_pending) return;
     g_load_pending = 0;
     cur = (INT16)rd16(g_screen_cur);
@@ -1268,19 +1436,22 @@ static int smm_do_shop(const char *how)
         smm_log("%s: shop 0x%X is not unlocked in this save yet (flag %X), skipped (VisitedOnly = 1)", how, id, flag);
         return 0;
     }
-    /* The shopkeeper's model must already be loaded here, or the shop crashes. Otherwise Sora
-       (the player's own model, always loaded) stands in until the shop closes. */
+    /* The shop shows its shopkeeper's 3D model and cannot load one: a model that is not in memory
+       crashes it. The model cache is no proof (1.9.1-test: the moogle's model was still listed
+       one room after the moogle, then the shop crashed with a stack overflow), so Sora (the
+       player's own model, always loaded) always stands in for the remote shop, until it closes.
+       Talking to the shopkeeper still shows the shopkeeper (the game's own path). */
     smm_keeper_restore("new shop");
     keeper = (WORD)(e[6] | e[7] << 8);
-    if (!smm_model_loaded(keeper)) {
-        if (!smm_model_loaded(SMM_OBJ_PLAYER)) {
-            smm_log("%s: shopkeeper %X is not loaded here and neither is the player model; not opening (it would crash)", how, keeper);
-            return 0;
-        }
+    if (!smm_model_loaded(SMM_OBJ_PLAYER)) {
+        smm_log("%s: the player model is not loaded here; not opening (it would crash)", how);
+        return 0;
+    }
+    if (keeper != SMM_OBJ_PLAYER) {
         g_keeper_orig = keeper;
         g_keeper_swapped = e;
         e[6] = (BYTE)(SMM_OBJ_PLAYER & 0xFF); e[7] = (BYTE)(SMM_OBJ_PLAYER >> 8);
-        smm_log("%s: shopkeeper %X is not loaded here, Sora stands in", how, keeper);
+        smm_logv("%s: Sora stands in for shopkeeper %X", how, keeper);
     }
     smm_log("%s: opening shop 0x%X%s (world %02X room %02X)", how, id, g_cfg.shop_id < 0 ? " (last moogle)" : "",
             rd8(SMM_WORLD), rd8(SMM_WORLD + 1));
@@ -1359,14 +1530,15 @@ static int smm_game_accepts_start(void)
 /* ---------------------------------------------------------------- hook callbacks (game thread) */
 
 /* exe+157312: the game is about to open its normal pause. 1 = we opened something instead. */
+static int g_start_pass = 0;           /* 1 = the Start site ran in this main-loop pass */
 static int SMM_GAME_ABI smm_on_start(void)
 {
+    /* This pass ends at the main-loop site; no D-pad keybind may open a second menu there. */
+    g_start_pass = 1;
     /* The game is handling a Start press, so our last pause has closed: tidy up now (no lockout). */
     if (g_pause_phase != 0) smm_pause_end("Start pressed again");
-    if (g_cfg.save_on && smm_bind_held(&g_cfg.save_bind, SMM_TRIG_START)) {
-        smm_do_save(g_save_name);
-        return 1;
-    }
+    if (g_cfg.save_on && smm_bind_held(&g_cfg.save_bind, SMM_TRIG_START))
+        return smm_do_save(g_save_name);
     if (g_cfg.pause_on && g_pause_ok && smm_bind_held(&g_cfg.pause_bind, SMM_TRIG_START))
         return smm_do_pause(g_pause_name, 0);
     if (g_cfg.load_on && smm_bind_held(&g_cfg.load_bind, SMM_TRIG_START))
@@ -1386,13 +1558,15 @@ static int SMM_GAME_ABI smm_on_special(void *obj)
 }
 
 static BYTE g_last_dpad = 0;
-static void smm_dpad_step(void)
+/* blocked = the Start code already handled a press this pass (only track the D-pad). */
+static void smm_dpad_step(int blocked)
 {
     BYTE pad = rd8(SMM_DPAD) & SMM_TRIG_DPAD, fresh = (BYTE)(pad & ~g_last_dpad);
     int save, pause, load, shop;
     const char *name;
     g_last_dpad = pad;
     if (!fresh || pad != fresh) return;                /* one direction, just pressed, nothing else held */
+    if (blocked) { smm_logv("D-pad keybind ignored: Start was handled in the same frame"); return; }
     save = g_cfg.save_on && smm_bind_held(&g_cfg.save_bind, pad);
     pause = g_cfg.pause_on && g_pause_ok && smm_bind_held(&g_cfg.pause_bind, pad);
     load = g_cfg.load_on && smm_bind_held(&g_cfg.load_bind, pad);
@@ -1418,8 +1592,10 @@ static void SMM_GAME_ABI smm_on_frame(void)
         g_base[g_slot1] = 0;
     if (g_pause_phase) smm_pause_step();
     if (g_keeper_swapped && rd32(g_shop_var) == 0xFFFFFFFF) smm_keeper_restore("shop closed");
-    if (g_gate_ok) smm_dpad_step();
+    if (g_gate_ok) smm_dpad_step(g_start_pass);
+    g_start_pass = 0;
 
+    if (!g_cfg.log_verbose) return;                    /* the rest only feeds the verbose log */
     btl = rd8(SMM_BTLTYP);
     if (btl != g_last_btl) {
         const char *what = btl == 0 ? " (out of battle)" : btl == 1 ? " (regular battle)" :
@@ -1509,6 +1685,37 @@ static int cave_openshop(BYTE *c, const void *fn, const BYTE *orig6, const BYTE 
     return put_jmp(c, n, back);
 }
 
+/* Function entry with all four argument registers kept: fn(entry rsp, r8d), then the original
+   5 bytes, jump back. */
+static int cave_shopentry(BYTE *c, const void *fn, const BYTE *orig5, const BYTE *back)
+{
+    static const BYTE pre[] = { 0x51, 0x52, 0x41, 0x50, 0x41, 0x51,          /* push rcx, rdx, r8, r9 */
+                                0x48, 0x8D, 0x4C, 0x24, 0x20,                /* lea rcx,[rsp+20h] (entry rsp) */
+                                0x44, 0x89, 0xC2 };                          /* mov edx,r8d */
+    static const BYTE tail[] = { 0x48, 0x89, 0xEC, 0x5D,                     /* mov rsp,rbp; pop rbp */
+                                 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59 };       /* pop r9, r8, rdx, rcx */
+    int n = put_bytes(c, 0, pre, sizeof(pre));
+    n = put_bytes(c, n, CAVE_ALIGN_PRO, sizeof(CAVE_ALIGN_PRO));
+    n = put_call(c, n, fn);
+    n = put_bytes(c, n, tail, sizeof(tail));
+    n = put_bytes(c, n, orig5, 5);
+    return put_jmp(c, n, back);
+}
+
+/* Shop view: call fn(rsi = view, r15d = shopkeeper), then make the call the site held (to
+   'target', no arguments) from here, and jump back past it. */
+static int cave_shopview(BYTE *c, const void *fn, const void *target, const BYTE *back)
+{
+    static const BYTE args[] = { 0x48, 0x89, 0xF1, 0x44, 0x89, 0xFA };      /* mov rcx,rsi; mov edx,r15d */
+    static const BYTE tail[] = { 0x48, 0x89, 0xEC, 0x5D };                    /* mov rsp,rbp; pop rbp */
+    int n = put_bytes(c, 0, CAVE_ALIGN_PRO, sizeof(CAVE_ALIGN_PRO));
+    n = put_bytes(c, n, args, sizeof(args));
+    n = put_call(c, n, fn);
+    n = put_bytes(c, n, tail, sizeof(tail));
+    n = put_call(c, n, target);                                               /* the original call */
+    return put_jmp(c, n, back);
+}
+
 static int cave_setup(BYTE *c, const void *fn, const BYTE *orig5, const BYTE *back)
 {
     static const BYTE tail[] = { 0x48, 0x89, 0xEC, 0x5D, 0x58 };              /* mov rsp,rbp; pop rbp; pop rax */
@@ -1592,13 +1799,79 @@ static int smm_write_jump(BYTE *site, BYTE *cave)
     return 1;
 }
 
+/* Data guard. Code is found by signature, but some data addresses (controller, world, battle
+   type, cutscene flags, KSX's tables) can only be listed (DA()). Every data address the code
+   names is compared with our notes: all the same = known layout; all moved by one amount (a game
+   update that shifted its data, as the wiki's first release -> v1.0.0.7 did by +0x2840) = the
+   listed ones are moved by that amount too; moved by different amounts = nothing is patched.
+   Also sets g_slot3 / g_slot1. 0 = do not patch. */
+static int smm_data_guard(void)
+{
+    static const BYTE lookup_head[14] = { 0x48, 0x83, 0xEC, 0x28, 0xB9, 0x05, 0x00, 0x00, 0x00, 0x48, 0x89, 0x5C, 0x24, 0x20 };
+    struct { const char *name; DWORD got, expected; } A[12];
+    int n = 0, i, even = 1;
+    DWORD S = g_targets[T_STARTCHECK].found, f, lookup;
+    INT64 d;
+    BYTE *s = g_base + S;
+
+    f = g_targets[T_OPENMENU].found;
+    A[n].name = "menu-open byte";    A[n].got = smm_rip(f, 2, 7);        A[n++].expected = 0x9006B0;
+    A[n].name = "menu queue";        A[n].got = smm_rip(f + 0x09, 2, 6); A[n++].expected = 0x716B48;
+    A[n].name = "current menu";      A[n].got = smm_rip(f + 0x18, 2, 6); A[n++].expected = 0x900724;
+    lookup = smm_rip(S + 0x06, 1, 5);
+    if (memcmp(g_base + lookup, lookup_head, 14) != 0 || g_base[lookup + 0x15] != 0x48 ||
+        g_base[lookup + 0x16] != 0x8D || g_base[lookup + 0x17] != 0x15) {
+        smm_log("HOOKS NOT INSTALLED: the pause slots could not be found (exe+%06X), so the game's data cannot be checked.", lookup);
+        return 0;
+    }
+    g_slot3 = smm_rip(lookup + 0x15, 3, 7) + 3 * 0x40;
+    g_slot1 = g_slot3 - 2 * 0x40;
+    A[n].name = "pause slot 3";      A[n].got = g_slot3;                 A[n++].expected = 0x2A11560;
+    if (s[-0x39] != 0x83 || s[-0x38] != 0x3D || s[-0x33] != 0x00) {
+        smm_log("HOOKS NOT INSTALLED: the pause state test in front of the Start code looks different.");
+        return 0;
+    }
+    A[n].name = "pause state";       A[n].got = smm_rip(S - 0x39, 2, 7); A[n++].expected = 0xABB878;
+    if (g_targets[T_PAUSESELECT].count == 1) {
+        A[n].name = "pause mode bits"; A[n].got = smm_rip(g_targets[T_PAUSESELECT].found + 0x0A, 2, 6); A[n++].expected = 0x749830;
+    }
+    if (g_targets[T_BUTTONS].count == 1) {
+        A[n].name = "pause button list"; A[n].got = smm_rip(g_targets[T_BUTTONS].found, 3, 7); A[n++].expected = 0xBEF538;
+    }
+    if (g_targets[T_SHOPTABLE].count == 1) {
+        A[n].name = "shop table pointer"; A[n].got = smm_rip(g_targets[T_SHOPTABLE].found, 3, 7); A[n++].expected = 0xBEE968;
+    }
+    if (g_targets[T_OPENSHOP].count == 1) {
+        f = g_targets[T_OPENSHOP].found;
+        A[n].name = "menu state";    A[n].got = smm_rip(f + 0x11, 2, 7); A[n++].expected = 0x716884;
+        A[n].name = "shop id";       A[n].got = smm_rip(f + 0x28, 2, 6); A[n++].expected = 0x716B50;
+    }
+    if (g_targets[T_GETPAD].count == 1) {
+        A[n].name = "controller (raw)"; A[n].got = smm_rip(g_targets[T_GETPAD].found + 3, 3, 7); A[n++].expected = 0xBF3270;
+    }
+    d = (INT64)A[0].got - A[0].expected;
+    for (i = 1; i < n; i++) if ((INT64)A[i].got - A[i].expected != d) even = 0;
+    if (!even) {
+        smm_log("HOOKS NOT INSTALLED: this game version moved its data by different amounts, so the addresses");
+        smm_log("  the module cannot find on its own (controller, world, battle state) are unknown:");
+        for (i = 0; i < n; i++)
+            smm_log("    %-18s exe+%06X (notes exe+%06X, %+lld)", A[i].name, A[i].got, A[i].expected, (long long)((INT64)A[i].got - A[i].expected));
+        return 0;
+    }
+    g_delta = d;
+    if (d) smm_log("Data guard: all %d data addresses the code names moved by %+lld (0x%llX); the listed ones are moved to match.",
+                   n, (long long)d, (unsigned long long)(d < 0 ? -d : d));
+    else smm_log("Data guard: all %d data addresses the code names match our notes.", n);
+    return 1;
+}
+
 static void smm_install_hooks(void)
 {
     BYTE *S, *block, orig[SMM_HOOK_COUNT][5];
     unsigned i;
     int lens[SMM_HOOK_COUNT];
     BYTE setup_orig[5];
-    int setup_len = 0, openshop_len = 0;
+    int setup_len = 0, openshop_len = 0, shopview_len = 0, shopentry_len = 0;
     int dpad = (g_cfg.save_on && g_cfg.save_bind.trig != SMM_TRIG_START) ||
                (g_cfg.pause_on && g_cfg.pause_bind.trig != SMM_TRIG_START) ||
                (g_cfg.load_on && g_cfg.load_bind.trig != SMM_TRIG_START) ||
@@ -1633,6 +1906,7 @@ static void smm_install_hooks(void)
         }
         memcpy(orig[i], g_hooks[i].site, 5);
     }
+    if (!smm_data_guard()) return;
 
     /* Optional parts: each one is switched off on its own if its code looks different. */
     g_pause_ok = (g_cfg.pause_on || g_cfg.load_on || dpad) ? smm_resolve_pause() : 0;
@@ -1650,18 +1924,20 @@ static void smm_install_hooks(void)
     /* Story flags (Journal button) and the remote shop. */
     g_shop_ok = smm_resolve_shop();
     if (g_cfg.shop_on && !g_shop_ok) g_cfg.shop_on = 0;
-    /* LoadMenu: the custom pause plus a hook at the end of the pause's setup. */
-    if (g_cfg.load_on) {
-        static const BYTE site[5] = { 0x48, 0x8B, 0x5C, 0x24, 0x50 };      /* mov rbx,[rsp+50h] */
+    /* A hook in the pause's screen task, after it built the button page: LoadMenu needs it (Load
+       Game as the first screen); the custom pause uses it to see that its pause started. The
+       task must test "screen == 9" before the site (the button page block) and "screen == 4"
+       right after it, both on the pause screen word. */
+    g_setup_hook = 0;
+    if (g_cfg.load_on || g_cfg.pause_on) {
         DWORD f = g_targets[T_PAUSESETUP].found;
-        g_setup_hook = 0;
         if (!g_pause_ok) smm_log("Load menu unavailable: needs the custom pause code.");
-        else if (g_targets[T_PAUSESETUP].count != 1) smm_log("Load menu unavailable: the pause setup code was not found.");
-        else if (memcmp(g_base + f + 0x2D, site, 5) != 0) smm_log("Load menu unavailable: unexpected bytes at the pause setup hook site.");
-        else if (g_base[f - 0x81] != 0x66 || g_base[f - 0x80] != 0x89 || g_base[f - 0x7F] != 0x05 ||
-                 smm_rip(f - 0x81, 3, 7) != g_screen_cur)
-            smm_log("Load menu unavailable: exe+%06X is not the setup that writes the pause screen.", f);
-        else g_setup_hook = f + 0x2D;
+        else if (g_targets[T_PAUSESETUP].count != 1) smm_log("Pause task hook unavailable (Load menu off): the pause screen task was not found.");
+        else if (smm_rip(f + 0x14, 3, 8) != g_screen_cur ||
+                 g_base[f - 0xAB] != 0x66 || g_base[f - 0xAA] != 0x83 || g_base[f - 0xA9] != 0x3D || g_base[f - 0xA4] != 0x09 ||
+                 smm_rip(f - 0xAB, 3, 8) != g_screen_cur)
+            smm_log("Pause task hook unavailable (Load menu off): exe+%06X is not the pause screen task we know.", f);
+        else g_setup_hook = f;
         if (!g_setup_hook) g_cfg.load_on = 0;
         else memcpy(setup_orig, g_base + g_setup_hook, 5);
     }
@@ -1682,7 +1958,7 @@ static void smm_install_hooks(void)
     lens[H_LOOP] = cave_loop(g_hooks[H_LOOP].cave, (const void *)(UINT_PTR)smm_on_frame, orig[H_LOOP],
                              S + SMM_LOOP_BACK);
     if (g_setup_hook)
-        setup_len = cave_setup(block + 0x300, (const void *)(UINT_PTR)smm_on_pause_setup, setup_orig,
+        setup_len = cave_setup(block + 0x300, (const void *)(UINT_PTR)smm_on_pause_task, setup_orig,
                                g_base + g_setup_hook + 5);
     /* Remote shop "Last": a hook at OpenShop's entry remembers the moogles the player talks to. */
     g_openshop_hook = 0;
@@ -1694,7 +1970,38 @@ static void smm_install_hooks(void)
             g_openshop_hook = f;
         } else smm_log("Last moogle tracking unavailable: unexpected bytes at OpenShop.");
     }
-    FlushInstructionCache(GetCurrentProcess(), block, 0x400);
+    /* Remote shop: Sora's size in the shop's 3D view. The scale it sets must come from four
+       1.0f, and the hook site must be a call. */
+    g_shopview_hook = 0;
+    if (g_cfg.shop_on && g_shop_ok) {
+        DWORD f = g_targets[T_SHOPVIEW].found, ones = smm_rip(f, 3, 7);
+        static const float one4[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        if (g_targets[T_SHOPVIEW].count != 1) smm_log("Shop size: the shop's 3D view code was not found; Sora stays full size.");
+        else if (memcmp(g_base + ones, one4, 16) != 0 || g_base[f + 0x1A] != 0xE8)
+            smm_log("Shop size: the shop's 3D view code looks different; Sora stays full size.");
+        else {
+            shopview_len = cave_shopview(block + 0x400, (const void *)(UINT_PTR)smm_on_shop_view,
+                                         g_base + smm_rip(f + 0x1A, 1, 5), g_base + f + 0x1F);
+            g_shopview_hook = f + 0x1A;
+        }
+    }
+    /* ... and his height: the same setup's entry (0x196 bytes before the scale code), where its
+       screen-centre arguments can still be changed. Its prologue and both stack reads checked. */
+    g_shopentry_hook = 0;
+    if (g_shopview_hook) {
+        static const BYTE pro[30] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18,
+                                      0x48, 0x89, 0x7C, 0x24, 0x20, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x70 };
+        static const BYTE rd_y[7] = { 0x8B, 0x84, 0x24, 0xC0, 0x00, 0x00, 0x00 };   /* mov eax,[rsp+C0h] = entry [rsp+38h] */
+        static const BYTE rd_x[7] = { 0x8B, 0x84, 0x24, 0xB8, 0x00, 0x00, 0x00 };   /* mov eax,[rsp+B8h] = entry [rsp+30h] */
+        DWORD e = g_targets[T_SHOPVIEW].found - 0x196;
+        if (memcmp(g_base + e, pro, 30) != 0 || memcmp(g_base + e + 0x9C, rd_y, 7) != 0 || memcmp(g_base + e + 0xB8, rd_x, 7) != 0)
+            smm_log("Shop height: the shop's 3D view setup looks different; Sora stays where the shop puts him.");
+        else {
+            shopentry_len = cave_shopentry(block + 0x480, (const void *)(UINT_PTR)smm_on_shop_view_entry, pro, g_base + e + 5);
+            g_shopentry_hook = e;
+        }
+    }
+    FlushInstructionCache(GetCurrentProcess(), block, 0x500);
 
     for (i = 0; i < SMM_HOOK_COUNT; i++) {
         if (!smm_write_jump(g_hooks[i].site, g_hooks[i].cave)) {
@@ -1719,9 +2026,9 @@ static void smm_install_hooks(void)
     /* Optional: the Load menu's hook. If it cannot be written only the Load menu is off. */
     if (g_setup_hook) {
         if (smm_write_jump(g_base + g_setup_hook, block + 0x300))
-            smm_log("PATCHED: %-22s exe+%06X -> cave %p (%d bytes)", "pause setup (Load)", g_setup_hook, block + 0x300, setup_len);
+            smm_log("PATCHED: %-22s exe+%06X -> cave %p (%d bytes)", "pause screen task", g_setup_hook, block + 0x300, setup_len);
         else {
-            smm_log("Load menu unavailable: could not write the pause setup hook.");
+            smm_log("Pause task hook unavailable (Load menu off): could not write it.");
             g_setup_hook = 0;
             g_cfg.load_on = 0;
         }
@@ -1732,6 +2039,22 @@ static void smm_install_hooks(void)
             smm_log("PATCHED: %-22s exe+%06X -> cave %p (%d bytes)", "OpenShop (last moogle)", g_openshop_hook, block + 0x380, openshop_len);
         else { smm_log("Last moogle tracking unavailable: could not write the OpenShop hook."); g_openshop_hook = 0; }
     }
+    /* Optional: Sora's size in the remote shop. */
+    if (g_shopview_hook) {
+        if (smm_write_jump(g_base + g_shopview_hook, block + 0x400))
+            smm_log("PATCHED: %-22s exe+%06X -> cave %p (%d bytes)", "shop view (Sora size)", g_shopview_hook, block + 0x400, shopview_len);
+        else { smm_log("Shop size: could not write the shop view hook; Sora stays full size."); g_shopview_hook = 0; }
+    }
+    if (g_shopentry_hook) {
+        if (smm_write_jump(g_base + g_shopentry_hook, block + 0x480))
+            smm_log("PATCHED: %-22s exe+%06X -> cave %p (%d bytes)", "shop view (Sora height)", g_shopentry_hook, block + 0x480, shopentry_len);
+        else { smm_log("Shop height: could not write the shop view entry hook."); g_shopentry_hook = 0; }
+    }
+    /* The caves are written: execute-read from now on (no writable code left behind). */
+    {
+        DWORD old;
+        if (!VirtualProtect(block, 0x1000, PAGE_EXECUTE_READ, &old)) smm_log("(Could not make the hook memory read-only; harmless.)");
+    }
     smm_read_last_shop();
     if (g_cfg.shop_on && g_cfg.shop_id < 0) {
         if (g_last_shop >= 0) smm_log("Remote shop: last moogle remembered, shop 0x%X", g_last_shop);
@@ -1739,7 +2062,8 @@ static void smm_install_hooks(void)
     }
 
     smm_log("Ready:");
-    smm_log("  Save menu:     %s", g_cfg.save_on ? g_save_name : "off");
+    smm_log("  Save menu:     %s%s", g_cfg.save_on ? g_save_name : "off",
+            g_cfg.save_in_battle ? " (saving in battle ON)" : " (no saving in battle, also not from the custom pause)");
     {
         char buttons[64] = "";
         if (g_cfg.show_save) strcat_s(buttons, sizeof(buttons), "Save, ");
@@ -1751,8 +2075,10 @@ static void smm_install_hooks(void)
         else smm_log("  Custom pause:  off");
     }
     smm_log("  Load menu:     %s", g_cfg.load_on ? g_load_name : "off");
-    if (g_cfg.shop_on && g_cfg.shop_id < 0) smm_log("  Remote shop:   %s (last moogle%s)", g_shop_name, g_cfg.shop_visited_only ? ", once unlocked" : "");
-    else if (g_cfg.shop_on) smm_log("  Remote shop:   %s (shop 0x%X%s)", g_shop_name, g_cfg.shop_id, g_cfg.shop_visited_only ? ", once unlocked" : "");
+    if (g_cfg.shop_on && g_cfg.shop_id < 0) smm_log("  Remote shop:   %s (last moogle%s; Sora shown at %d%%)", g_shop_name,
+                                                    g_cfg.shop_visited_only ? ", once unlocked" : "", g_shopview_hook ? g_cfg.shop_standin_size : 100);
+    else if (g_cfg.shop_on) smm_log("  Remote shop:   %s (shop 0x%X%s; Sora shown at %d%%)", g_shop_name, g_cfg.shop_id,
+                                    g_cfg.shop_visited_only ? ", once unlocked" : "", g_shopview_hook ? g_cfg.shop_standin_size : 100);
     else smm_log("  Remote shop:   off");
     smm_log("  Party menu:    in battle %s, in missions %s", g_cfg.party_battle ? "on" : "off", g_cfg.party_missions ? "on" : "off");
 }
@@ -1821,8 +2147,10 @@ static DWORD WINAPI smm_retry_thread(LPVOID unused)
 {
     int tries;
     (void)unused;
-    for (tries = 0; tries < 180; tries++) {
-        Sleep(500);
+    /* A few tries only: after a game update the signatures never match, and every full scan
+       costs ~50 ms of CPU while the game boots. */
+    for (tries = 0; tries < 6; tries++) {
+        Sleep(1000);
         if (smm_probe(0)) {
             smm_log("(resolved on retry %d, for the log only)", tries + 1);
             return 0;
@@ -1835,7 +2163,9 @@ static DWORD WINAPI smm_retry_thread(LPVOID unused)
 /* ---------------------------------------------------------------- crash report */
 /* If the game crashes, write where (exe+offset) and the code addresses on the stack to the log
    before Windows ends it. Only real faults are logged (not the C++ exceptions games throw and
-   catch), at most a few, and the exception is always passed on unchanged. */
+   catch), at most a few, and the exception is always passed on unchanged. This handler runs
+   before the game's own handlers, so a fault the game (or another mod) catches is logged too:
+   hence "fault", and "CRASH" only means something if the game closed right after. */
 #ifndef SMM_TEST_ALLOC
 static volatile LONG g_crash_logged = 0;
 static LONG CALLBACK smm_on_exception(EXCEPTION_POINTERS *ep)
@@ -1852,9 +2182,11 @@ static LONG CALLBACK smm_on_exception(EXCEPTION_POINTERS *ep)
     end = base + nt->OptionalHeader.SizeOfImage;
     rip = (UINT_PTR)ep->ContextRecord->Rip;
     if (rip >= base && rip < end)
-        smm_log("CRASH: exception %08X at exe+%06X", code, (unsigned)(rip - base));
+        smm_log("FAULT %08X at exe+%06X (if the game closed right after this, this is the CRASH)", code, (unsigned)(rip - base));
     else
-        smm_log("CRASH: exception %08X at %p (outside the game exe)", code, (void *)rip);
+        smm_log("FAULT %08X at %p, outside the game exe (if the game closed right after this, this is the CRASH)", code, (void *)rip);
+    /* Stack overflow included: Windows leaves this handler enough stack (1.9-test2 logged a full
+       report for one), and the call chain is what tells which object the game tried to use. */
     if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
         smm_log("  %s address %p", ep->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
                 (void *)ep->ExceptionRecord->ExceptionInformation[1]);
@@ -1870,7 +2202,7 @@ static LONG CALLBACK smm_on_exception(EXCEPTION_POINTERS *ep)
         if (VirtualQuery(sp, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT) {
             UINT_PTR top = (UINT_PTR)mbi.BaseAddress + mbi.RegionSize;
             for (i = 0; i < 512 && (UINT_PTR)(sp + i + 1) <= top && found < 16; i++) {
-                if (sp[i] > base + 0x1000 && sp[i] < base + 0x579000) {
+                if (sp[i] > base + g_code_lo && sp[i] < base + g_code_hi) {
                     char one[16];
                     _snprintf_s(one, sizeof(one), _TRUNCATE, " exe+%06X", (unsigned)(sp[i] - base));
                     strcat_s(line, sizeof(line), one);
@@ -1880,6 +2212,7 @@ static LONG CALLBACK smm_on_exception(EXCEPTION_POINTERS *ep)
         }
         smm_log("  stack:%s", found ? line : " (no game code addresses)");
     }
+    if (g_log != INVALID_HANDLE_VALUE) FlushFileBuffers(g_log);   /* the process may end now */
     return EXCEPTION_CONTINUE_SEARCH;
 }
 #endif
@@ -1897,12 +2230,14 @@ static void smm_start(void)
     smm_log("Settings: %s%s", g_ini_state == 0 ? "ShroMagicMenu.ini" :
             g_ini_state == 1 ? "ShroMagicMenu.ini was missing, defaults written" :
             g_ini_state == 2 ? "ShroMagicMenu.ini missing and could not be written, defaults used" :
+            g_ini_state == 4 ? "ShroMagicMenu.ini is saved as Unicode (UTF-16); save it as ANSI or UTF-8. Defaults used" :
                                "ShroMagicMenu.ini could not be read, defaults used",
             problems ? " (problems above)" : "");
 
     g_base = (BYTE *)GetModuleHandleW(NULL);
     smm_log("Game module base %p", g_base);
     if (!g_base) return;
+    smm_identify_build();
 #ifndef SMM_TEST_ALLOC
     if (g_cfg.log_on) AddVectoredExceptionHandler(0, smm_on_exception);
 #endif

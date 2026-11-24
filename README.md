@@ -1,6 +1,6 @@
 # KH2-Magic-Menu
 
-Shro's Magic Menu (v1.9): KSX's menu Lua scripts reworked as a native .DLL, with additional features.
+Shro's Magic Menu (v1.9.1): KSX's menu Lua scripts reworked as a native .DLL, with additional features.
 
 KH2 Final Mix, PC (Steam Global, Nov 2026 build). Loaded by OpenKH Panacea. Idea and original
 scripts by KSX.
@@ -9,8 +9,8 @@ scripts by KSX.
 
 | Input | Result |
 |---|---|
-| **R1 + Start** | Save point menu, instantly |
-| **R2 + Start** | **Custom pause**: Save / Load Game / Jiminy's Journal / Continue, anywhere but the World Map (field, battles, missions) |
+| **R1 + Start** | Save point menu, instantly (not during battles or on the World Map; see `SaveInBattle`) |
+| **R2 + Start** | **Custom pause**: Save / Load Game / Jiminy's Journal / Continue, anywhere but the World Map (field, battles, missions); no Save button during battles unless `SaveInBattle = 1` |
 | **L1 + Start** | **Load Game** screen straight away (backing out shows the custom pause; Continue resumes) |
 | **L2 + Start** | **Remote shop**: the last moogle you talked to, from anywhere outside battle (synthesis included) |
 | **Start in any battle** | Party menu, missions included |
@@ -31,6 +31,7 @@ affected setting keeps its default.
 |---|---|---|
 | `[SaveMenu] Enabled` | 1 | Save menu keybind on/off |
 | `[SaveMenu] Keybind` | `R1+Start` | see Keybinds |
+| `[SaveMenu] SaveInBattle` | 0 | Allow saving during a battle (this keybind and the custom pause's Save button). **A save made mid-battle, above all in a boss fight or mission, may load into a broken state or softlock the game**: keep a separate save from before the fight. |
 | `[CustomPause] Enabled` | 1 | Custom pause on/off |
 | `[CustomPause] Keybind` | `R2+Start` | see Keybinds |
 | `[CustomPause] ShowSave` / `ShowLoadGame` / `ShowJournal` | 1 / 1 / 1 | Which buttons the pause shows (Continue always) |
@@ -40,6 +41,8 @@ affected setting keeps its default.
 | `[RemoteShop] Enabled` / `Keybind` | 1 / `L2+Start` | Remote shop on/off, keybind |
 | `[RemoteShop] ShopId` | `Last` | `Last` = the last moogle you talked to (kept in `ShroMagicMenu-lastshop.txt`; the Hollow Bastion moogle, 0x13, until you have talked to one), or a shop id such as `0x13`. The log lists every shop id the first time the keybind is used |
 | `[RemoteShop] VisitedOnly` | 1 | Only shops whose unlock flag is set in the save (you have met that shopkeeper) |
+| `[RemoteShop] StandInSize` | 40 | Sora's size in the shop window, in percent (10 to 100); he stands in for the shopkeeper and is much bigger than a moogle. Set through the shop view's own scale (exe+2FECD0 hook), only while the remote shop is open. |
+| `[RemoteShop] StandInLift` | 120 | How far Sora is raised in the shop window, in the menu's screen units (about 448 high; -300 to 300), so he sits centred instead of with his feet cut off. Moves the shop camera's screen centre (the view setup's own arguments, exe+2FEB20 hook). |
 | `[PartyMenu] InBattle` | 1 | Start in battle opens the party menu instead of the battle pause |
 | `[PartyMenu] InMissions` | 1 | The same in mission battles that have their own pause (outside cutscenes) |
 | `[Log] Enabled` | 1 | Write ShroMagicMenu.log |
@@ -90,25 +93,35 @@ once at load, and for the save menu keybind clears a leftover mode 2 before open
 
 ## How the Load keybind and the remote shop work
 
-**Load**: the keybind opens the custom pause, and a hook at the end of the pause's setup
-(exe+31D34D) makes its first screen 3, the load screen (the one the Load Game button asks for),
-instead of 9, the button page. Backing out of Load returns to the button page as usual.
+**Load**: the keybind opens the custom pause, and a hook in the pause's screen task (exe+31D499),
+after it has built the button page, makes its first screen 3, the load screen (the one the Load
+Game button asks for), instead of 9, the button page. Backing out of Load returns to the button
+page as usual. (1.9 switched the screen before the button page was built; backing out of Load
+could then crash on stale objects, seen after a shop had been open. Fixed in 1.9.1.)
 
 **Remote shop**: the keybind calls the game's own OpenShop(id) (exe+1518E0), the function its event
 code calls when you talk to a shopkeeper. Forcing a Shop reaction command onto Triangle does not
 work: a reaction command runs on the object it belongs to (the moogle), so without one nearby the
 game crashes. The shop screen shows its shopkeeper as a 3D model and can only use a model that is
-already loaded where you stand, so the module checks the game's model cache first and, if the
-shopkeeper is not loaded, puts the game's "current player" object (Sora) in its place until the
-shop closes. A hook at OpenShop's entry remembers the moogle shops you open by talking to a moogle.
+already loaded where you stand, so the module puts the game's "current player" object (Sora,
+always loaded) in the shopkeeper's place until the shop closes. (1.9 checked the game's model
+cache and kept the shopkeeper when its model was listed; a model still listed one room on crashed
+the shop in 1.9.1 testing, so Sora now always stands in.) A hook at OpenShop's entry remembers the moogle shops you open by talking to a moogle.
 
 The story flags (Save+2390, exe+9ABC40) decide the rest: each shop's unlock flag for VisitedOnly,
 and flag 0x73 (Save+239E) for the Journal button.
 
 ## How it works
 
-- At load it finds eleven pieces of game code by byte signature and logs them, with the addresses decoded
-  from inside them.
+- At load it logs the exe's build stamp and finds twelve pieces of game code by byte signature,
+  with the addresses decoded from inside them. On the build these notes are from (stamp
+  `669E384A`), each signature is checked where it is known to be; on any other build the whole
+  game code is scanned.
+- **Data guard**: some game data can't be found from code (controller, world, battle state,
+  cutscene flags, KSX's tables) and is listed at its known address. Every data address the code
+  does name is compared with the notes: if all match, fine; if all moved by one amount (as a game
+  update does when it shifts its data), the listed ones are moved by that amount too and the log
+  says so; if they moved by different amounts, nothing is patched.
 - It installs three 5-byte hooks in the game's Start-button and main-loop code, at sites with no
   rip-relative operands:
   - **exe+157304** (`test rax,rax / jne`): where the game decides between a special pause and the
@@ -117,9 +130,10 @@ and flag 0x73 (Save+239E) for the Journal button.
   - **exe+157312** (`mov edx,-1`): Start keybinds.
   - **exe+15732A**: once per main-loop pass: clears the battle pause slot's active byte, D-pad
     keybinds, custom pause tidy-up, and (verbose) battle type and cutscene changes.
-  - Optional: **exe+31D34D** (end of the pause setup, Load keybind) and **exe+1518E0** (OpenShop's
-    entry, last moogle).
-- If the game crashes, the log records where (exe offset, registers, call chain).
+  - Optional: **exe+31D499** (the pause's screen task, after the button page is built: Load
+    keybind, and the custom pause's tidy-up) and **exe+1518E0** (OpenShop's entry, last moogle).
+- Faults are logged as `FAULT` with where (exe offset, registers, call chain). The game catches
+  some faults itself, so a `FAULT` line only means a crash if the game closed right after it.
 - Every code address is read out of the game's own code at load, with cross-checks. Hooks are
   written once in DllMain, all or nothing. Optional parts (custom pause, D-pad keybinds,
   ForceWorldTravel) switch off on their own if their code looks different. It refuses to run on
@@ -129,8 +143,8 @@ and flag 0x73 (Save+239E) for the Journal button.
 
 1. Run `build_msvc64.bat`, check for `8664 machine (x64)`.
 2. Copy `mod\ShroMagicMenu.dll` into your mod folder under `openkh\mods\kh2\`, rebuild in Mods
-   Manager. The log's first line should say `Shro's Magic Menu 1.9`, followed by the settings line,
-   five `PATCHED:` lines and a `Ready:` summary of the active keybinds.
+   Manager. The log's first line should say `Shro's Magic Menu 1.9.1`, followed by the settings line,
+   the build stamp, `Data guard: all 11 data addresses ... match our notes`, five `PATCHED:` lines and a `Ready:` summary of the active keybinds.
 3. Remove the old Lua script, if any; this module replaces it.
 
 ## Test (from a save)
@@ -143,8 +157,8 @@ and flag 0x73 (Save+239E) for the Journal button.
 5. Coliseum cup (or any fight whose pause had Retry): R2 + Start shows the game's pause with Retry;
    the log says "the game's pause offers Retry here". Plain Start gives the party menu.
 . L1 + Start in the field and in battle: the load screen; backing out shows the pause buttons.
-8. Talk to a moogle, then L2 + Start elsewhere: that moogle's shop, with Sora shown when the moogle
-   is not nearby. The log says "remembered for the shop keybind". In battle it does nothing.
+8. Talk to a moogle, then L2 + Start elsewhere: that moogle's shop, with Sora shown in the
+   moogle's place. The log says "remembered for the shop keybind". In battle it does nothing.
 
 ## Tests (for development)
 
@@ -155,6 +169,9 @@ and flag 0x73 (Save+239E) for the Journal button.
   toggles, custom Start keybinds, the game's Retry pause (Start and D-pad), D-pad keybinds behind the game's Start checks, ForceWorldTravel
   and the party menu toggles. Mutation 1 changes the Load case and checks only the custom pause
   is disabled.
+- `tests/harness_win.c` (Windows, MSVC): the same idea for 1.9 onwards: real signature scan (fast
+  path and full scan), data guard (even and uneven moves), Load menu, remote shop, story flags,
+  SaveInBattle, settings files with BOM / UTF-16, crash log.
 - `tests/harness3.c` and `tests/check_signatures.py`: older tests against bytes taken from Cheat Engine
   dumps (`tests/dump_bytes.h`). That file holds game code, so it is not in the repo; generate it from
   your own dumps to run these.

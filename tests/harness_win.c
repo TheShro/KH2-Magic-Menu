@@ -69,7 +69,24 @@ int main(int argc, char **argv)
 {
     unsigned i;
     if (argc < 2 || !map_exe(argv[1])) { printf("usage: harness_win <KINGDOM HEARTS II FINAL MIX.exe>\n"); return 2; }
+
+    /* --- 1.9.1: the full scan (any other build) finds every signature exactly once, where the
+       known-build fast path looks. Run before the hooks change the code. */
+    {
+        int all = 1;
+        g_base = g_img;
+        g_known_build = 0;
+        smm_probe(1);
+        for (i = 0; i < SMM_TARGET_COUNT; i++)
+            if (g_targets[i].count != 1 || g_targets[i].found != g_targets[i].expected) {
+                printf("  full scan: %s count %d at exe+%06X\n", g_targets[i].name, g_targets[i].count, g_targets[i].found);
+                all = 0;
+            }
+        check(all, "full scan: every signature unique, at the offset the fast path checks (GetPad included)");
+        g_base = NULL;
+    }
     smm_start();
+    check(g_known_build && g_code_lo == 0x1000 && g_code_hi > 0x579000, "known build recognised from the PE header; code range from the sections");
 
     /* --- signatures and derived addresses */
     for (i = 0; i < SMM_TARGET_COUNT; i++) {
@@ -81,31 +98,52 @@ int main(int argc, char **argv)
     check(g_shop_table == 0xBEE968, "shop table pointer = exe+BEE968");
     check(g_shop_var == 0x716B50, "shop id variable = exe+716B50");
     check(g_shop_ok && g_open_shop == (SmmShopFn)(g_img + 0x1518E0), "OpenShop = exe+1518E0");
-    check(g_setup_hook == 0x31D34D && g_img[0x31D34D] == 0xE9, "pause setup hook written at exe+31D34D");
+    check(g_setup_hook == 0x31D499 && g_img[0x31D499] == 0xE9, "pause screen task hook written at exe+31D499 (after the button page is built)");
     check(g_img[0x157304] == 0xE9 && g_img[0x157312] == 0xE9 && g_img[0x15732A] == 0xE9, "three main hooks written");
     check(g_cfg.load_on && g_cfg.shop_on && g_cfg.save_on && g_cfg.pause_on, "all keybind features on with defaults");
 
-    /* --- Load menu: run the real hook through a copy of the setup's own prologue + the patched tail */
+    /* --- 1.9.1 data guard: move the data the code names (its rip displacements) and check that
+       an even move shifts the listed addresses with it and an uneven one refuses. */
     {
-        /* mov [rsp+8],rbx; mov [rsp+10h],rsi; push rdi; sub rsp,40h; jmp exe+31D34D */
-        BYTE *t = g_img + 0x2D90000;
-        static const BYTE pro[] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x40 };
-        INT32 rel;
-        memcpy(t, pro, sizeof(pro));
-        t[sizeof(pro)] = 0xE9;
-        rel = (INT32)((g_img + 0x31D34D) - (t + sizeof(pro) + 5));
-        memcpy(t + sizeof(pro) + 1, &rel, 4);
+        static const DWORD disp[] = { 0x151772, 0x15177B, 0x15178A,           /* OpenMenu: menu-open, queue, current menu */
+                                      0x3AD558,                               /* slot lookup: lea rdx,[slots] */
+                                      0x1572C2,                               /* pause state test in front of the Start code */
+                                      0x2E498F, 0x31DE85, 0x2FBA61,           /* pause mode bits, button list, shop table */
+                                      0x1518F3, 0x15190A, 0x39B766 };         /* menu state, shop id, raw pad */
+        unsigned k;
+        INT32 v;
+        check(g_delta == 0 && SMM_WORLD == 0x717008 && SMM_CUT_PAUSE == 0x2A115A0 && SMM_PAUSE_BLOCK == 0x2A11562,
+              "data guard, known build: no shift; slot 4 / slot 3 block derived from slot 3");
+        for (k = 0; k < sizeof(disp) / sizeof(disp[0]); k++) { memcpy(&v, g_img + disp[k], 4); v += 0x40; memcpy(g_img + disp[k], &v, 4); }
+        check(smm_data_guard() && g_delta == 0x40 && SMM_WORLD == 0x717048 && SMM_SHOULDERS == 0x71342B && g_slot3 == 0x2A115A0,
+              "data guard, all data moved +0x40: listed addresses moved with it");
+        memcpy(&v, g_img + disp[0], 4); v += 0x10; memcpy(g_img + disp[0], &v, 4);
+        g_delta = 0;
+        check(!smm_data_guard(), "data guard, data moved unevenly: refuses (nothing patched)");
+        memcpy(&v, g_img + disp[0], 4); v -= 0x10; memcpy(g_img + disp[0], &v, 4);
+        for (k = 0; k < sizeof(disp) / sizeof(disp[0]); k++) { memcpy(&v, g_img + disp[k], 4); v -= 0x40; memcpy(g_img + disp[k], &v, 4); }
+        check(smm_data_guard() && g_delta == 0 && g_slot3 == 0x2A11560, "data guard back on the real layout");
+    }
+
+    /* --- Load menu: run the real hook at exe+31D499 (the pause screen task, after the button page
+       is built). The cave runs mov edx,1 and jumps back to exe+31D49E; a ret placed there for the
+       test returns to us. */
+    {
+        void (*t)(void) = (void (*)(void))(g_img + 0x31D499);
+        BYTE keep = g_img[0x31D49E];
+        g_img[0x31D49E] = 0xC3;
         w16(0x744C10, 9); w16(0x744C14, 0xFFFF);
         g_load_pending = 0;
         ((void (*)(void))t)();
-        check(r16(0x744C10) == 9 && r16(0x744C14) == 0xFFFF, "setup hook, no Load pending: pause starts on the button page (9)");
+        check(r16(0x744C10) == 9 && r16(0x744C14) == 0xFFFF, "task hook, no Load pending: pause starts on the button page (9)");
         g_load_pending = 1;
         ((void (*)(void))t)();
-        check(r16(0x744C10) == 3 && r16(0x744C14) == 0xFFFF && !g_load_pending, "setup hook, Load pending: pause starts on the load screen (3), request untouched");
+        check(r16(0x744C10) == 3 && r16(0x744C14) == 0xFFFF && !g_load_pending, "task hook, Load pending: pause starts on the load screen (3), request untouched");
         w16(0x744C10, 3); g_load_pending = 1;
         ((void (*)(void))t)();
-        check(r16(0x744C10) == 3 && !g_load_pending, "setup hook, unexpected screen: left alone");
+        check(r16(0x744C10) == 3 && !g_load_pending, "task hook, unexpected screen: left alone");
         w16(0x744C10, 0xFFFF);
+        g_img[0x31D49E] = keep;
     }
 
     /* --- remote shop with a stand-in OpenShop and a stand-in shop table */
@@ -151,9 +189,12 @@ int main(int argc, char **argv)
         check(!smm_do_shop("test"), "cutscene: refused");
         w32(SMM_CUT_FLAGS, 1);
 
-        /* shopkeeper model: loaded -> as is; not loaded -> Sora (0x236) until the shop closes */
+        /* shopkeeper model: Sora (0x236) always stands in until the shop closes; a model still in
+           the cache is no proof it is safe (1.9.1-test crash) */
         g_cfg.shop_id = 0x13; w32(0x716B50, 0xFFFFFFFF);
-        check(smm_do_shop("test") && r16(0x2DA0016) == 0x50F && !g_keeper_swapped, "moogle loaded here: shopkeeper kept");
+        check(smm_do_shop("test") && r16(0x2DA0016) == SMM_OBJ_PLAYER && g_keeper_swapped, "moogle listed as loaded: Sora still stands in");
+        w32(0x716B50, 0xFFFFFFFF); smm_on_frame();
+        check(r16(0x2DA0016) == 0x50F && !g_keeper_swapped, "shop closed: moogle put back (1)");
         w32(0x716B50, 0xFFFFFFFF);
         g_loaded_a = 0;                                                 /* the next room */
         check(smm_do_shop("test") && r16(0x2DA0016) == SMM_OBJ_PLAYER && g_keeper_swapped, "moogle not loaded: Sora stands in");
@@ -235,6 +276,125 @@ int main(int argc, char **argv)
         g_cfg.show_save = 1; g_cfg.show_load = 0;
         smm_pause_fill(); smm_pause_restore("test");
         check(g_pause_val[1] == 2 && g_pause_val[2] == 0x0011 && g_pause_val[3] == 0xC52C, "ShowLoadGame 0: only Save (11 / C52C) + Continue");
+    }
+
+    /* --- 1.9.1: no saving in battle (default), World Map refused for the Save keybind */
+    {
+        g_cfg.show_save = 1; g_cfg.show_load = 1; g_cfg.show_journal = 0; g_cfg.save_in_battle = 0;
+        g_img[SMM_WORLD] = 0x04; g_img[SMM_BTLTYP] = 1;
+        check(!smm_do_save("test"), "Save keybind in battle, SaveInBattle 0: refused");
+        g_pause_slot = g_slot3;
+        smm_pause_fill(); smm_pause_restore("test");
+        check(g_pause_val[1] == 2 && g_pause_val[2] == SMM_FN_LOAD && g_pause_val[4] == SMM_FN_CONTINUE,
+              "custom pause in battle, SaveInBattle 0: Load Game / Continue, no Save");
+        g_cfg.save_in_battle = 1;
+        smm_pause_fill(); smm_pause_restore("test");
+        check(g_pause_val[1] == 3 && g_pause_val[4] == SMM_FN_SAVE, "custom pause in battle, SaveInBattle 1: Save offered");
+        g_img[SMM_BTLTYP] = 0; g_img[SMM_WORLD] = SMM_WORLD_MAP;
+        check(!smm_do_save("test"), "Save keybind on the World Map: refused");
+        g_img[SMM_WORLD] = 0x04; g_cfg.save_in_battle = 0;
+        memcpy(g_ini_text, SMM_DEFAULT_INI, sizeof(SMM_DEFAULT_INI));
+        check(smm_load_settings(0) == 0 && !g_cfg.save_in_battle, "default settings: SaveInBattle = 0");
+    }
+
+    /* --- 1.9.1: a D-pad keybind does not fire in a pass where Start was handled */
+    {
+        g_cfg.pause_on = 1; g_cfg.pause_bind.mods = 0x02; g_cfg.pause_bind.trig = SMM_TRIG_DOWN;
+        g_img[SMM_SHOULDERS] = 0x02; g_img[SMM_DPAD] = SMM_TRIG_DOWN; g_last_dpad = 0;
+        g_pause_phase = 0;
+        smm_dpad_step(1);                                  /* the gate would be called next: it is not */
+        check(g_pause_phase == 0 && g_last_dpad == SMM_TRIG_DOWN, "D-pad keybind in the same pass as a Start keybind: ignored");
+        g_img[SMM_SHOULDERS] = 0; g_img[SMM_DPAD] = 0;
+        g_cfg.pause_bind.mods = 0x02; g_cfg.pause_bind.trig = SMM_TRIG_START;
+    }
+
+    /* --- 1.9.1: the pause-setup hook tells the custom pause that it started (prompt restore) */
+    {
+        g_load_pending = 0; g_pause_phase = 1; g_pause_frames = 50;
+        smm_on_pause_task();
+        check(g_pause_phase == 2 && g_pause_frames == 0, "pause setup seen: custom pause waits for the close, not the timeout");
+        g_pause_slot = g_slot3; smm_pause_fill();
+        w16(g_screen_cur, 0xFFFF);
+        smm_pause_step();
+        check(g_pause_phase == 0, "first main-loop pass after the close: values restored");
+    }
+
+    /* --- 1.9.1: settings file saved by Notepad as UTF-8 with BOM or as UTF-16 */
+    {
+        wchar_t path[MAX_PATH];
+        HANDLE h;
+        DWORD n;
+        static const char bom[] = "\xEF\xBB\xBF[SaveMenu]\r\nSaveInBattle = 1\r\n";
+        static const char u16[] = "\xFF\xFE[\0S\0";
+        smm_game_path(path, L"ShroMagicMenu.ini");
+        h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        WriteFile(h, bom, sizeof(bom) - 1, &n, NULL); CloseHandle(h);
+        smm_read_ini();
+        check(g_ini_state == 0 && smm_load_settings(0) == 0 && g_cfg.save_in_battle, "UTF-8 with BOM: parsed, first section kept");
+        h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        WriteFile(h, u16, sizeof(u16) - 1, &n, NULL); CloseHandle(h);
+        smm_read_ini();
+        check(g_ini_state == 4 && g_ini_text[0] == 0, "UTF-16: recognised, defaults used");
+        DeleteFileW(path);                                 /* the next run writes the defaults again */
+    }
+
+    /* --- 1.9.1: Sora's size in the remote shop's 3D view, through the real hook at exe+2FECD0.
+       A stub sets rsi (view) and r15d (shopkeeper) and calls the site; the original call's target
+       and the return point get a test ret. */
+    {
+        static float view[16];
+        BYTE *stub = g_img + 0x2D90100, keep1 = g_img[0x166850], keep2 = g_img[0x2FECD5], dummy[8] = { 0 };
+        int n = 0;
+        INT32 rel;
+        UINT64 vp = (UINT64)(UINT_PTR)view;
+        DWORD keeper;
+        static const char ini[] = "[RemoteShop]\r\nStandInSize = 40\r\nStandInLift = -25\r\n";
+        static const char bad[] = "[RemoteShop]\r\nStandInSize = 300\r\n";
+        check(g_shopview_hook == 0x2FECD0 && g_img[0x2FECD0] == 0xE9, "shop view hook written at exe+2FECD0");
+        g_img[0x166850] = 0xC3; g_img[0x2FECD5] = 0xC3;
+        stub[n++] = 0x56; stub[n++] = 0x41; stub[n++] = 0x57;                       /* push rsi; push r15 */
+        stub[n++] = 0x48; stub[n++] = 0xBE; memcpy(stub + n, &vp, 8); n += 8;      /* mov rsi,view */
+        stub[n++] = 0x41; stub[n++] = 0xBF; n += 4;                                 /* mov r15d,keeper (set below) */
+        stub[n++] = 0xE8; rel = (INT32)((g_img + 0x2FECD0) - (stub + n + 4)); memcpy(stub + n, &rel, 4); n += 4;
+        stub[n++] = 0x41; stub[n++] = 0x5F; stub[n++] = 0x5E; stub[n++] = 0xC3;   /* pop r15; pop rsi; ret */
+        /* the view as the game just set it: rotation (0,0,0,0), position (0,0,0,1), scale (1,1,1,1) */
+#define RUN_VIEW(k) do { int i_; for (i_ = 0; i_ < 4; i_++) { view[i_] = 0.0f; view[4 + i_] = i_ == 3 ? 1.0f : 0.0f; view[8 + i_] = 1.0f; } \
+                         keeper = (k); memcpy(stub + 15, &keeper, 4); ((void (*)(void))stub)(); } while (0)
+        g_cfg.shop_standin_size = 50; g_cfg.shop_standin_lift = 30;
+        g_keeper_swapped = dummy;
+        RUN_VIEW(0x20000236);
+        check(view[8] == 0.5f && view[9] == 0.5f && view[10] == 0.5f && view[11] == 1.0f && view[5] == 0.0f,
+              "remote shop, Sora standing in: shown at 50%");
+        RUN_VIEW(0x20000487);
+        check(view[8] == 1.0f, "a moogle in the view: left as it is");
+        g_keeper_swapped = NULL;
+        RUN_VIEW(0x20000236);
+        check(view[8] == 1.0f, "no stand-in (not our shop): left as it is");
+#undef RUN_VIEW
+        g_img[0x166850] = keep1; g_img[0x2FECD5] = keep2;
+
+        /* height: the real entry hook at exe+2FEB20; a test "mov eax,[rsp+38h]; ret" after the
+           replaced instruction returns the screen-centre y the setup would use */
+        {
+            typedef int (*EntryFn)(void *, int, int, int, int, int, int);
+            static const BYTE ret_y[5] = { 0x8B, 0x44, 0x24, 0x38, 0xC3 };
+            BYTE keep[5];
+            EntryFn fn = (EntryFn)(g_img + 0x2FEB20);
+            check(g_shopentry_hook == 0x2FEB20 && g_img[0x2FEB20] == 0xE9, "shop view entry hook written at exe+2FEB20");
+            memcpy(keep, g_img + 0x2FEB25, 5); memcpy(g_img + 0x2FEB25, ret_y, 5);
+            g_keeper_swapped = dummy;
+            check(fn(NULL, 0, 0x20000236, 0, 0, 40, 60) == 60 - 30, "Sora standing in: screen centre y raised by StandInLift (60 -> 30)");
+            check(fn(NULL, 0, 0x20000487, 0, 0, 40, 60) == 60, "a moogle: screen centre left alone");
+            g_keeper_swapped = NULL;
+            check(fn(NULL, 0, 0x20000236, 0, 0, 40, 60) == 60, "not our shop: screen centre left alone");
+            memcpy(g_img + 0x2FEB25, keep, 5);
+        }
+        memcpy(g_ini_text, ini, sizeof(ini));
+        check(smm_load_settings(0) == 0 && g_cfg.shop_standin_size == 40 && g_cfg.shop_standin_lift == -25, "StandInSize = 40, StandInLift = -25 parsed");
+        memcpy(g_ini_text, bad, sizeof(bad));
+        check(smm_load_settings(0) == 1 && g_cfg.shop_standin_size == 40, "StandInSize = 300: out of range, 40 used");
+        memcpy(g_ini_text, SMM_DEFAULT_INI, sizeof(SMM_DEFAULT_INI));
+        check(smm_load_settings(0) == 0 && g_cfg.shop_standin_size == 40 && g_cfg.shop_standin_lift == 120, "defaults: StandInSize 40, StandInLift 120");
     }
 
     printf(fails ? "%d FAILED\n" : "ALL PASS\n", fails);

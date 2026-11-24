@@ -22,7 +22,7 @@ typedef struct { WORD wYear, wMonth, wDayOfWeek, wDay, wHour, wMinute, wSecond, 
 typedef DWORD (*LPTHREAD_START_ROUTINE)(LPVOID);
 typedef struct { WORD e_magic; BYTE pad[58]; int32_t e_lfanew; } IMAGE_DOS_HEADER;
 typedef struct { WORD Machine, NumberOfSections; DWORD TimeDateStamp, PointerToSymbolTable, NumberOfSymbols; WORD SizeOfOptionalHeader, Characteristics; } IMAGE_FILE_HEADER;
-typedef struct { BYTE raw[240]; } IMAGE_OPTIONAL_HEADER64;
+typedef struct { BYTE pre[56]; DWORD SizeOfImage; BYTE rest[180]; } IMAGE_OPTIONAL_HEADER64;
 typedef struct { DWORD Signature; IMAGE_FILE_HEADER FileHeader; IMAGE_OPTIONAL_HEADER64 OptionalHeader; } IMAGE_NT_HEADERS64;
 typedef struct { BYTE Name[8]; union { DWORD VirtualSize; } Misc; DWORD VirtualAddress, SizeOfRawData, PointerToRawData, PointerToRelocations, PointerToLinenumbers; WORD NumberOfRelocations, NumberOfLinenumbers; DWORD Characteristics; } IMAGE_SECTION_HEADER;
 #define IMAGE_FIRST_SECTION(nt) ((IMAGE_SECTION_HEADER *)((BYTE *)&(nt)->OptionalHeader + (nt)->FileHeader.SizeOfOptionalHeader))
@@ -52,6 +52,7 @@ typedef struct { void *BaseAddress; DWORD State; } MEMORY_BASIC_INFORMATION;
 #define MEM_RESERVE 0x2000
 #define MEM_COMMIT 0x1000
 #define PAGE_EXECUTE_READWRITE 0x40
+#define PAGE_EXECUTE_READ 0x20
 void GetSystemInfo(SYSTEM_INFO *si);
 SIZE_T VirtualQuery(LPCVOID a, MEMORY_BASIC_INFORMATION *m, SIZE_T n);
 void *VirtualAlloc(void *a, SIZE_T s, DWORD t, DWORD p);
