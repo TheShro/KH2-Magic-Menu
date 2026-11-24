@@ -20,3 +20,7 @@ dumps/
 # Local settings and logs
 ShroMagicMenu.ini
 ShroMagicMenu.log
+
+# Research notes stay local (kept outside the public repo)
+docs/research-notes.md
+*research-notes*.md
