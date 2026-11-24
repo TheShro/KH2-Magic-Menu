@@ -101,9 +101,10 @@ could then crash on stale objects, seen after a shop had been open. Fixed in 1.9
 code calls when you talk to a shopkeeper. Forcing a Shop reaction command onto Triangle does not
 work: a reaction command runs on the object it belongs to (the moogle), so without one nearby the
 game crashes. The shop screen shows its shopkeeper as a 3D model and can only use a model that is
-already loaded where you stand, so the module checks the game's model cache first and, if the
-shopkeeper is not loaded, puts the game's "current player" object (Sora) in its place until the
-shop closes. A hook at OpenShop's entry remembers the moogle shops you open by talking to a moogle.
+already loaded where you stand, so the module puts the game's "current player" object (Sora,
+always loaded) in the shopkeeper's place until the shop closes. (1.9 checked the game's model
+cache and kept the shopkeeper when its model was listed; a model still listed one room on crashed
+the shop in 1.9.1 testing, so Sora now always stands in.) A hook at OpenShop's entry remembers the moogle shops you open by talking to a moogle.
 
 The story flags (Save+2390, exe+9ABC40) decide the rest: each shop's unlock flag for VisitedOnly,
 and flag 0x73 (Save+239E) for the Journal button.
@@ -154,8 +155,8 @@ and flag 0x73 (Save+239E) for the Journal button.
 5. Coliseum cup (or any fight whose pause had Retry): R2 + Start shows the game's pause with Retry;
    the log says "the game's pause offers Retry here". Plain Start gives the party menu.
 . L1 + Start in the field and in battle: the load screen; backing out shows the pause buttons.
-8. Talk to a moogle, then L2 + Start elsewhere: that moogle's shop, with Sora shown when the moogle
-   is not nearby. The log says "remembered for the shop keybind". In battle it does nothing.
+8. Talk to a moogle, then L2 + Start elsewhere: that moogle's shop, with Sora shown in the
+   moogle's place. The log says "remembered for the shop keybind". In battle it does nothing.
 
 ## Tests (for development)
 
