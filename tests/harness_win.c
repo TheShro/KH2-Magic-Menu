@@ -69,7 +69,24 @@ int main(int argc, char **argv)
 {
     unsigned i;
     if (argc < 2 || !map_exe(argv[1])) { printf("usage: harness_win <KINGDOM HEARTS II FINAL MIX.exe>\n"); return 2; }
+
+    /* --- 1.9.1: the full scan (any other build) finds every signature exactly once, where the
+       known-build fast path looks. Run before the hooks change the code. */
+    {
+        int all = 1;
+        g_base = g_img;
+        g_known_build = 0;
+        smm_probe(1);
+        for (i = 0; i < SMM_TARGET_COUNT; i++)
+            if (g_targets[i].count != 1 || g_targets[i].found != g_targets[i].expected) {
+                printf("  full scan: %s count %d at exe+%06X\n", g_targets[i].name, g_targets[i].count, g_targets[i].found);
+                all = 0;
+            }
+        check(all, "full scan: every signature unique, at the offset the fast path checks (GetPad included)");
+        g_base = NULL;
+    }
     smm_start();
+    check(g_known_build && g_code_lo == 0x1000 && g_code_hi > 0x579000, "known build recognised from the PE header; code range from the sections");
 
     /* --- signatures and derived addresses */
     for (i = 0; i < SMM_TARGET_COUNT; i++) {
@@ -84,6 +101,29 @@ int main(int argc, char **argv)
     check(g_setup_hook == 0x31D34D && g_img[0x31D34D] == 0xE9, "pause setup hook written at exe+31D34D");
     check(g_img[0x157304] == 0xE9 && g_img[0x157312] == 0xE9 && g_img[0x15732A] == 0xE9, "three main hooks written");
     check(g_cfg.load_on && g_cfg.shop_on && g_cfg.save_on && g_cfg.pause_on, "all keybind features on with defaults");
+
+    /* --- 1.9.1 data guard: move the data the code names (its rip displacements) and check that
+       an even move shifts the listed addresses with it and an uneven one refuses. */
+    {
+        static const DWORD disp[] = { 0x151772, 0x15177B, 0x15178A,           /* OpenMenu: menu-open, queue, current menu */
+                                      0x3AD558,                               /* slot lookup: lea rdx,[slots] */
+                                      0x1572C2,                               /* pause state test in front of the Start code */
+                                      0x2E498F, 0x31DE85, 0x2FBA61,           /* pause mode bits, button list, shop table */
+                                      0x1518F3, 0x15190A, 0x39B766 };         /* menu state, shop id, raw pad */
+        unsigned k;
+        INT32 v;
+        check(g_delta == 0 && SMM_WORLD == 0x717008 && SMM_CUT_PAUSE == 0x2A115A0 && SMM_PAUSE_BLOCK == 0x2A11562,
+              "data guard, known build: no shift; slot 4 / slot 3 block derived from slot 3");
+        for (k = 0; k < sizeof(disp) / sizeof(disp[0]); k++) { memcpy(&v, g_img + disp[k], 4); v += 0x40; memcpy(g_img + disp[k], &v, 4); }
+        check(smm_data_guard() && g_delta == 0x40 && SMM_WORLD == 0x717048 && SMM_SHOULDERS == 0x71342B && g_slot3 == 0x2A115A0,
+              "data guard, all data moved +0x40: listed addresses moved with it");
+        memcpy(&v, g_img + disp[0], 4); v += 0x10; memcpy(g_img + disp[0], &v, 4);
+        g_delta = 0;
+        check(!smm_data_guard(), "data guard, data moved unevenly: refuses (nothing patched)");
+        memcpy(&v, g_img + disp[0], 4); v -= 0x10; memcpy(g_img + disp[0], &v, 4);
+        for (k = 0; k < sizeof(disp) / sizeof(disp[0]); k++) { memcpy(&v, g_img + disp[k], 4); v -= 0x40; memcpy(g_img + disp[k], &v, 4); }
+        check(smm_data_guard() && g_delta == 0 && g_slot3 == 0x2A11560, "data guard back on the real layout");
+    }
 
     /* --- Load menu: run the real hook through a copy of the setup's own prologue + the patched tail */
     {
@@ -235,6 +275,66 @@ int main(int argc, char **argv)
         g_cfg.show_save = 1; g_cfg.show_load = 0;
         smm_pause_fill(); smm_pause_restore("test");
         check(g_pause_val[1] == 2 && g_pause_val[2] == 0x0011 && g_pause_val[3] == 0xC52C, "ShowLoadGame 0: only Save (11 / C52C) + Continue");
+    }
+
+    /* --- 1.9.1: no saving in battle (default), World Map refused for the Save keybind */
+    {
+        g_cfg.show_save = 1; g_cfg.show_load = 1; g_cfg.show_journal = 0; g_cfg.save_in_battle = 0;
+        g_img[SMM_WORLD] = 0x04; g_img[SMM_BTLTYP] = 1;
+        check(!smm_do_save("test"), "Save keybind in battle, SaveInBattle 0: refused");
+        g_pause_slot = g_slot3;
+        smm_pause_fill(); smm_pause_restore("test");
+        check(g_pause_val[1] == 2 && g_pause_val[2] == SMM_FN_LOAD && g_pause_val[4] == SMM_FN_CONTINUE,
+              "custom pause in battle, SaveInBattle 0: Load Game / Continue, no Save");
+        g_cfg.save_in_battle = 1;
+        smm_pause_fill(); smm_pause_restore("test");
+        check(g_pause_val[1] == 3 && g_pause_val[4] == SMM_FN_SAVE, "custom pause in battle, SaveInBattle 1: Save offered");
+        g_img[SMM_BTLTYP] = 0; g_img[SMM_WORLD] = SMM_WORLD_MAP;
+        check(!smm_do_save("test"), "Save keybind on the World Map: refused");
+        g_img[SMM_WORLD] = 0x04; g_cfg.save_in_battle = 0;
+        memcpy(g_ini_text, SMM_DEFAULT_INI, sizeof(SMM_DEFAULT_INI));
+        check(smm_load_settings(0) == 0 && !g_cfg.save_in_battle, "default settings: SaveInBattle = 0");
+    }
+
+    /* --- 1.9.1: a D-pad keybind does not fire in a pass where Start was handled */
+    {
+        g_cfg.pause_on = 1; g_cfg.pause_bind.mods = 0x02; g_cfg.pause_bind.trig = SMM_TRIG_DOWN;
+        g_img[SMM_SHOULDERS] = 0x02; g_img[SMM_DPAD] = SMM_TRIG_DOWN; g_last_dpad = 0;
+        g_pause_phase = 0;
+        smm_dpad_step(1);                                  /* the gate would be called next: it is not */
+        check(g_pause_phase == 0 && g_last_dpad == SMM_TRIG_DOWN, "D-pad keybind in the same pass as a Start keybind: ignored");
+        g_img[SMM_SHOULDERS] = 0; g_img[SMM_DPAD] = 0;
+        g_cfg.pause_bind.mods = 0x02; g_cfg.pause_bind.trig = SMM_TRIG_START;
+    }
+
+    /* --- 1.9.1: the pause-setup hook tells the custom pause that it started (prompt restore) */
+    {
+        g_load_pending = 0; g_pause_phase = 1; g_pause_frames = 50;
+        smm_on_pause_setup();
+        check(g_pause_phase == 2 && g_pause_frames == 0, "pause setup seen: custom pause waits for the close, not the timeout");
+        g_pause_slot = g_slot3; smm_pause_fill();
+        w16(g_screen_cur, 0xFFFF);
+        smm_pause_step();
+        check(g_pause_phase == 0, "first main-loop pass after the close: values restored");
+    }
+
+    /* --- 1.9.1: settings file saved by Notepad as UTF-8 with BOM or as UTF-16 */
+    {
+        wchar_t path[MAX_PATH];
+        HANDLE h;
+        DWORD n;
+        static const char bom[] = "\xEF\xBB\xBF[SaveMenu]\r\nSaveInBattle = 1\r\n";
+        static const char u16[] = "\xFF\xFE[\0S\0";
+        smm_game_path(path, L"ShroMagicMenu.ini");
+        h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        WriteFile(h, bom, sizeof(bom) - 1, &n, NULL); CloseHandle(h);
+        smm_read_ini();
+        check(g_ini_state == 0 && smm_load_settings(0) == 0 && g_cfg.save_in_battle, "UTF-8 with BOM: parsed, first section kept");
+        h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        WriteFile(h, u16, sizeof(u16) - 1, &n, NULL); CloseHandle(h);
+        smm_read_ini();
+        check(g_ini_state == 4 && g_ini_text[0] == 0, "UTF-16: recognised, defaults used");
+        DeleteFileW(path);                                 /* the next run writes the defaults again */
     }
 
     printf(fails ? "%d FAILED\n" : "ALL PASS\n", fails);
