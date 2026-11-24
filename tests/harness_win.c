@@ -338,6 +338,43 @@ int main(int argc, char **argv)
         DeleteFileW(path);                                 /* the next run writes the defaults again */
     }
 
+    /* --- 1.9.1: Sora's size in the remote shop's 3D view, through the real hook at exe+2FECD0.
+       A stub sets rsi (view) and r15d (shopkeeper) and calls the site; the original call's target
+       and the return point get a test ret. */
+    {
+        static float view[16];
+        BYTE *stub = g_img + 0x2D90100, keep1 = g_img[0x166850], keep2 = g_img[0x2FECD5], dummy[8] = { 0 };
+        int n = 0;
+        INT32 rel;
+        UINT64 vp = (UINT64)(UINT_PTR)view;
+        DWORD keeper;
+        static const char ini[] = "[RemoteShop]\r\nStandInSize = 40\r\n";
+        static const char bad[] = "[RemoteShop]\r\nStandInSize = 300\r\n";
+        check(g_shopview_hook == 0x2FECD0 && g_img[0x2FECD0] == 0xE9, "shop view hook written at exe+2FECD0");
+        g_img[0x166850] = 0xC3; g_img[0x2FECD5] = 0xC3;
+        stub[n++] = 0x56; stub[n++] = 0x41; stub[n++] = 0x57;                       /* push rsi; push r15 */
+        stub[n++] = 0x48; stub[n++] = 0xBE; memcpy(stub + n, &vp, 8); n += 8;      /* mov rsi,view */
+        stub[n++] = 0x41; stub[n++] = 0xBF; n += 4;                                 /* mov r15d,keeper (set below) */
+        stub[n++] = 0xE8; rel = (INT32)((g_img + 0x2FECD0) - (stub + n + 4)); memcpy(stub + n, &rel, 4); n += 4;
+        stub[n++] = 0x41; stub[n++] = 0x5F; stub[n++] = 0x5E; stub[n++] = 0xC3;   /* pop r15; pop rsi; ret */
+#define RUN_VIEW(k) do { int i_; for (i_ = 0; i_ < 4; i_++) view[8 + i_] = 1.0f; keeper = (k); memcpy(stub + 15, &keeper, 4); ((void (*)(void))stub)(); } while (0)
+        g_cfg.shop_standin_size = 50;
+        g_keeper_swapped = dummy;
+        RUN_VIEW(0x20000236);
+        check(view[8] == 0.5f && view[9] == 0.5f && view[10] == 0.5f && view[11] == 1.0f, "remote shop, Sora standing in: shown at 50%");
+        RUN_VIEW(0x20000487);
+        check(view[8] == 1.0f, "a moogle in the view: left at full size");
+        g_keeper_swapped = NULL;
+        RUN_VIEW(0x20000236);
+        check(view[8] == 1.0f, "no stand-in (not our shop): left at full size");
+#undef RUN_VIEW
+        g_img[0x166850] = keep1; g_img[0x2FECD5] = keep2;
+        memcpy(g_ini_text, ini, sizeof(ini));
+        check(smm_load_settings(0) == 0 && g_cfg.shop_standin_size == 40, "StandInSize = 40 parsed");
+        memcpy(g_ini_text, bad, sizeof(bad));
+        check(smm_load_settings(0) == 1 && g_cfg.shop_standin_size == 50, "StandInSize = 300: out of range, 50 used");
+    }
+
     printf(fails ? "%d FAILED\n" : "ALL PASS\n", fails);
     return fails != 0;
 }

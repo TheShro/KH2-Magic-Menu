@@ -123,6 +123,7 @@ typedef struct {
     int shop_id;
     int shop_visited_only;
     int save_in_battle;
+    int shop_standin_size;            /* percent: Sora's size in the remote shop's 3D view */
 } SmmConfig;
 static const SmmConfig SMM_DEFAULTS = {
     1, { 0x08, SMM_TRIG_START },       /* save menu: R1 + Start */
@@ -136,7 +137,8 @@ static const SmmConfig SMM_DEFAULTS = {
     1, { 0x01, SMM_TRIG_START },       /* remote shop: L2 + Start */
     -1,                                /* shop: the last moogle used (Last), else 0x13 */
     1,                                 /* only shops the story has already unlocked */
-    0                                  /* no saving during a battle */
+    0,                                 /* no saving during a battle */
+    50                                 /* Sora at 50% in the remote shop */
 };
 static SmmConfig g_cfg;
 
@@ -196,6 +198,8 @@ static const char SMM_DEFAULT_INI[] =
 "ShopId = Last\r\n"
 "; 1 = only shops the story has already unlocked (you have met that shopkeeper).\r\n"
 "VisitedOnly = 1\r\n"
+"; Sora's size in the shop window, in percent (Sora is much bigger than a moogle): 10 to 100.\r\n"
+"StandInSize = 50\r\n"
 "\r\n"
 "[PartyMenu]\r\n"
 "; Start in battle opens the party menu instead of the battle pause.\r\n"
@@ -441,6 +445,7 @@ static int smm_load_settings(int quiet)
                 else if (smm_ieq(key, "Keybind")) bind = &g_cfg.shop_bind;
                 else if (smm_ieq(key, "ShopId")) { if (smm_ieq(val, "Last")) { g_cfg.shop_id = -1; continue; } num = &g_cfg.shop_id; }
                 else if (smm_ieq(key, "VisitedOnly")) flag = &g_cfg.shop_visited_only;
+                else if (smm_ieq(key, "StandInSize")) num = &g_cfg.shop_standin_size;
             } else if (smm_ieq(section, "SaveMenu")) {
                 if (smm_ieq(key, "Enabled")) flag = &g_cfg.save_on;
                 else if (smm_ieq(key, "Keybind")) bind = &g_cfg.save_bind;
@@ -484,6 +489,11 @@ static int smm_load_settings(int quiet)
                 problems++;
             }
         }
+    }
+    if (g_cfg.shop_standin_size < 10 || g_cfg.shop_standin_size > 100) {
+        if (!quiet) smm_log("Settings: [RemoteShop] StandInSize = %d is not 10 to 100, 50 used", g_cfg.shop_standin_size);
+        g_cfg.shop_standin_size = 50;
+        problems++;
     }
     /* A keybind of None switches its feature off. */
     if (!g_cfg.save_bind.trig) g_cfg.save_on = 0;
@@ -584,10 +594,17 @@ static SmmTarget g_targets[] = {
     { "GetPad",
       "48 63 C1 48 8D 0D ?? ?? ?? ?? 48 6B C0 58 48 03 C1 C3",
       0x39B760, 0, 0 },
+    /* RemoteShop only: the shop's 3D shopkeeper view setup (exe+2FEB20, view object in rsi,
+       shopkeeper | 0x20000000 in r15d) sets the view's scale vector [rsi+20h] from four 1.0f
+       (movaps xmm0,[rip] / lea rcx,[rsi+20h] / ... / call / call). Hook site: the second call. */
+    { "ShopViewScale",
+      "0F 28 05 ?? ?? ?? ?? 48 8D 4E 20 48 8D 54 24 60 0F 11 44 24 60 E8 ?? ?? ?? ?? E8",
+      0x2FECB6, 0, 0 },
 };
 #define SMM_TARGET_COUNT (sizeof(g_targets) / sizeof(g_targets[0]))
 enum { T_OPENMENU = 0, T_STARTCHECK = 1, T_PAUSESELECT = 2, T_PAUSETAIL = 3, T_BUTTONS = 4, T_SAVEMODE = 5,
-       T_OPENSHOP = 6, T_SHOPTABLE = 7, T_PAUSESETUP = 8, T_KEEPERMODEL = 9, T_KEEPERENTRY = 10, T_GETPAD = 11 };
+       T_OPENSHOP = 6, T_SHOPTABLE = 7, T_PAUSESETUP = 8, T_KEEPERMODEL = 9, T_KEEPERENTRY = 10, T_GETPAD = 11,
+       T_SHOPVIEW = 12 };
 
 #define SMM_MAX_SIG 128
 
@@ -1030,6 +1047,23 @@ static void smm_write_last_shop(int id)
 /* Moogles are the shops whose shopkeeper is a moogle object: 0x487 (every world's moogle) or
    0x50F (Hollow Bastion's). Seen in the shop table: these are the shops that offer synthesis. */
 static int smm_is_moogle(WORD keeper) { return keeper == 0x487 || keeper == 0x50F; }
+
+/* exe+2FECD0, in the shop's 3D view setup, right after it set the view's scale to 1.0: while
+   our remote shop has Sora standing in (and this view is that stand-in), shrink him to
+   StandInSize percent. Sora is far bigger than a moogle and overfills the shop window. The view
+   belongs to the shop and goes with it, so nothing needs putting back. */
+static DWORD g_shopview_hook = 0;      /* exe+2FECD0, 0 = not hooked */
+static void SMM_GAME_ABI smm_on_shop_view(BYTE *view, DWORD keeper)
+{
+    float s[3], one;
+    int k;
+    if (!g_keeper_swapped || keeper != (SMM_OBJ_PLAYER | SMM_KEEPER_FLAG) || g_cfg.shop_standin_size >= 100) return;
+    memcpy(&one, view + 0x20, 4);
+    if (one != 1.0f) { smm_log("Shop view: scale is %g, not 1.0; Sora left at full size", (double)one); return; }
+    for (k = 0; k < 3; k++) s[k] = (float)g_cfg.shop_standin_size / 100.0f;
+    memcpy(view + 0x20, s, sizeof(s));
+    smm_logv("Shop view: Sora at %d%%", g_cfg.shop_standin_size);
+}
 
 static const BYTE *smm_shop_entry(int id, int *count);
 
@@ -1617,6 +1651,20 @@ static int cave_openshop(BYTE *c, const void *fn, const BYTE *orig6, const BYTE 
     return put_jmp(c, n, back);
 }
 
+/* Shop view: call fn(rsi = view, r15d = shopkeeper), then make the call the site held (to
+   'target', no arguments) from here, and jump back past it. */
+static int cave_shopview(BYTE *c, const void *fn, const void *target, const BYTE *back)
+{
+    static const BYTE args[] = { 0x48, 0x89, 0xF1, 0x44, 0x89, 0xFA };      /* mov rcx,rsi; mov edx,r15d */
+    static const BYTE tail[] = { 0x48, 0x89, 0xEC, 0x5D };                    /* mov rsp,rbp; pop rbp */
+    int n = put_bytes(c, 0, CAVE_ALIGN_PRO, sizeof(CAVE_ALIGN_PRO));
+    n = put_bytes(c, n, args, sizeof(args));
+    n = put_call(c, n, fn);
+    n = put_bytes(c, n, tail, sizeof(tail));
+    n = put_call(c, n, target);                                               /* the original call */
+    return put_jmp(c, n, back);
+}
+
 static int cave_setup(BYTE *c, const void *fn, const BYTE *orig5, const BYTE *back)
 {
     static const BYTE tail[] = { 0x48, 0x89, 0xEC, 0x5D, 0x58 };              /* mov rsp,rbp; pop rbp; pop rax */
@@ -1772,7 +1820,7 @@ static void smm_install_hooks(void)
     unsigned i;
     int lens[SMM_HOOK_COUNT];
     BYTE setup_orig[5];
-    int setup_len = 0, openshop_len = 0;
+    int setup_len = 0, openshop_len = 0, shopview_len = 0;
     int dpad = (g_cfg.save_on && g_cfg.save_bind.trig != SMM_TRIG_START) ||
                (g_cfg.pause_on && g_cfg.pause_bind.trig != SMM_TRIG_START) ||
                (g_cfg.load_on && g_cfg.load_bind.trig != SMM_TRIG_START) ||
@@ -1871,7 +1919,22 @@ static void smm_install_hooks(void)
             g_openshop_hook = f;
         } else smm_log("Last moogle tracking unavailable: unexpected bytes at OpenShop.");
     }
-    FlushInstructionCache(GetCurrentProcess(), block, 0x400);
+    /* Remote shop: Sora's size in the shop's 3D view. The scale it sets must come from four
+       1.0f, and the hook site must be a call. */
+    g_shopview_hook = 0;
+    if (g_cfg.shop_on && g_shop_ok) {
+        DWORD f = g_targets[T_SHOPVIEW].found, ones = smm_rip(f, 3, 7);
+        static const float one4[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        if (g_targets[T_SHOPVIEW].count != 1) smm_log("Shop size: the shop's 3D view code was not found; Sora stays full size.");
+        else if (memcmp(g_base + ones, one4, 16) != 0 || g_base[f + 0x1A] != 0xE8)
+            smm_log("Shop size: the shop's 3D view code looks different; Sora stays full size.");
+        else {
+            shopview_len = cave_shopview(block + 0x400, (const void *)(UINT_PTR)smm_on_shop_view,
+                                         g_base + smm_rip(f + 0x1A, 1, 5), g_base + f + 0x1F);
+            g_shopview_hook = f + 0x1A;
+        }
+    }
+    FlushInstructionCache(GetCurrentProcess(), block, 0x500);
 
     for (i = 0; i < SMM_HOOK_COUNT; i++) {
         if (!smm_write_jump(g_hooks[i].site, g_hooks[i].cave)) {
@@ -1909,6 +1972,12 @@ static void smm_install_hooks(void)
             smm_log("PATCHED: %-22s exe+%06X -> cave %p (%d bytes)", "OpenShop (last moogle)", g_openshop_hook, block + 0x380, openshop_len);
         else { smm_log("Last moogle tracking unavailable: could not write the OpenShop hook."); g_openshop_hook = 0; }
     }
+    /* Optional: Sora's size in the remote shop. */
+    if (g_shopview_hook) {
+        if (smm_write_jump(g_base + g_shopview_hook, block + 0x400))
+            smm_log("PATCHED: %-22s exe+%06X -> cave %p (%d bytes)", "shop view (Sora size)", g_shopview_hook, block + 0x400, shopview_len);
+        else { smm_log("Shop size: could not write the shop view hook; Sora stays full size."); g_shopview_hook = 0; }
+    }
     /* The caves are written: execute-read from now on (no writable code left behind). */
     {
         DWORD old;
@@ -1934,8 +2003,10 @@ static void smm_install_hooks(void)
         else smm_log("  Custom pause:  off");
     }
     smm_log("  Load menu:     %s", g_cfg.load_on ? g_load_name : "off");
-    if (g_cfg.shop_on && g_cfg.shop_id < 0) smm_log("  Remote shop:   %s (last moogle%s)", g_shop_name, g_cfg.shop_visited_only ? ", once unlocked" : "");
-    else if (g_cfg.shop_on) smm_log("  Remote shop:   %s (shop 0x%X%s)", g_shop_name, g_cfg.shop_id, g_cfg.shop_visited_only ? ", once unlocked" : "");
+    if (g_cfg.shop_on && g_cfg.shop_id < 0) smm_log("  Remote shop:   %s (last moogle%s; Sora shown at %d%%)", g_shop_name,
+                                                    g_cfg.shop_visited_only ? ", once unlocked" : "", g_shopview_hook ? g_cfg.shop_standin_size : 100);
+    else if (g_cfg.shop_on) smm_log("  Remote shop:   %s (shop 0x%X%s; Sora shown at %d%%)", g_shop_name, g_cfg.shop_id,
+                                    g_cfg.shop_visited_only ? ", once unlocked" : "", g_shopview_hook ? g_cfg.shop_standin_size : 100);
     else smm_log("  Remote shop:   off");
     smm_log("  Party menu:    in battle %s, in missions %s", g_cfg.party_battle ? "on" : "off", g_cfg.party_missions ? "on" : "off");
 }
