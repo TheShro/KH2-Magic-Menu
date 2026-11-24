@@ -124,7 +124,7 @@ typedef struct {
     int shop_visited_only;
     int save_in_battle;
     int shop_standin_size;            /* percent: Sora's size in the remote shop's 3D view */
-    int shop_standin_lift;            /* game units: how far Sora is raised in that view */
+    int shop_standin_lift;            /* menu screen units: how far that view's centre is raised */
 } SmmConfig;
 static const SmmConfig SMM_DEFAULTS = {
     1, { 0x08, SMM_TRIG_START },       /* save menu: R1 + Start */
@@ -140,7 +140,7 @@ static const SmmConfig SMM_DEFAULTS = {
     1,                                 /* only shops the story has already unlocked */
     0,                                 /* no saving during a battle */
     50,                                /* Sora at 50% in the remote shop */
-    30                                 /* ... raised by 30 units */
+    100                                /* ... raised by 100 screen units */
 };
 static SmmConfig g_cfg;
 
@@ -202,8 +202,9 @@ static const char SMM_DEFAULT_INI[] =
 "VisitedOnly = 1\r\n"
 "; Sora's size in the shop window, in percent (Sora is much bigger than a moogle): 10 to 100.\r\n"
 "StandInSize = 50\r\n"
-"; How far Sora is raised in the shop window, in game units (-300 to 300; negative = lower).\r\n"
-"StandInLift = 30\r\n"
+"; How far Sora is raised in the shop window, in the menu's screen units (the menu screen is\r\n"
+"; about 448 high; -300 to 300; negative = lower).\r\n"
+"StandInLift = 100\r\n"
 "\r\n"
 "[PartyMenu]\r\n"
 "; Start in battle opens the party menu instead of the battle pause.\r\n"
@@ -1061,32 +1062,41 @@ static void smm_write_last_shop(int id)
    0x50F (Hollow Bastion's). Seen in the shop table: these are the shops that offer synthesis. */
 static int smm_is_moogle(WORD keeper) { return keeper == 0x487 || keeper == 0x50F; }
 
-/* exe+2FECD0, in the shop's 3D view setup, right after it set the view's scale to 1.0: while
-   our remote shop has Sora standing in (and this view is that stand-in), shrink him to
-   StandInSize percent and raise him by StandInLift. Sora is far bigger than a moogle and
-   overfills the shop window with his feet cut off. The view (all just set by the game):
-   +0 rotation (0,0,0,0), +0x10 position (0,0,0,1), +0x20 scale (1,1,1,1). KH2's Y axis points
-   down (the shop camera's up vector is (0,-1,0)), so up is -Y. (1.9.1-test: writing +4 did
-   nothing; that is the rotation.) It belongs to the shop and goes with it, so nothing needs
-   putting back. */
+/* exe+2FECD0, in the shop's 3D view setup (exe+2FEB20), right after it set the view's scale to
+   1.0: while our remote shop has Sora standing in (and this view is that stand-in), shrink him
+   to StandInSize percent. Sora is far bigger than a moogle and overfills the shop window. The
+   view: +0 rotation, +0x10 position, +0x20 scale. (1.9.1-test: moving the view's position did
+   nothing; the shop places the model through its camera, see smm_on_shop_view_entry.) It belongs
+   to the shop and goes with it, so nothing needs putting back. */
 static DWORD g_shopview_hook = 0;      /* exe+2FECD0, 0 = not hooked */
+static DWORD g_shopentry_hook = 0;     /* exe+2FEB20, 0 = not hooked */
 static void SMM_GAME_ABI smm_on_shop_view(BYTE *view, DWORD keeper)
 {
-    float s[3], one, y, w;
+    float s[3], one;
     int k;
     if (!g_keeper_swapped || keeper != (SMM_OBJ_PLAYER | SMM_KEEPER_FLAG)) return;
     memcpy(&one, view + 0x20, 4);
-    memcpy(&y, view + 0x14, 4);
-    memcpy(&w, view + 0x1C, 4);
-    if (one != 1.0f || y != 0.0f || w != 1.0f) {
-        smm_log("Shop view: scale %g / height %g / w %g, not 1 / 0 / 1; Sora left as he is", (double)one, (double)y, (double)w);
-        return;
-    }
+    if (one != 1.0f) { smm_log("Shop view: scale %g, not 1; Sora left at full size", (double)one); return; }
     for (k = 0; k < 3; k++) s[k] = (float)g_cfg.shop_standin_size / 100.0f;
     memcpy(view + 0x20, s, sizeof(s));
-    y = (float)-g_cfg.shop_standin_lift;
-    memcpy(view + 0x14, &y, 4);
-    smm_logv("Shop view: Sora at %d%%, raised by %d", g_cfg.shop_standin_size, g_cfg.shop_standin_lift);
+    smm_logv("Shop view: Sora at %d%%", g_cfg.shop_standin_size);
+}
+
+/* exe+2FEB20, entry of the shop's 3D view setup. Its 6th and 7th arguments (stack, [rsp+30h] and
+   [rsp+38h] at entry) are the view's screen centre x and y (from the shop layout; the setup adds
+   0x800 and hands them to the camera's projection, exe+19DC50). Raising the centre (smaller y)
+   raises Sora in the window. Only for the stand-in, only while our remote shop is open; the
+   arguments are the caller's copies, so nothing needs putting back. */
+static void SMM_GAME_ABI smm_on_shop_view_entry(BYTE *entry_rsp, DWORD keeper)
+{
+    INT32 x, y;
+    if (!g_keeper_swapped || keeper != (SMM_OBJ_PLAYER | SMM_KEEPER_FLAG)) return;
+    memcpy(&x, entry_rsp + 0x30, 4);
+    memcpy(&y, entry_rsp + 0x38, 4);
+    if (x < -2048 || x > 2048 || y < -2048 || y > 2048) { smm_log("Shop view: centre %d,%d looks wrong; Sora left where he is", x, y); return; }
+    smm_log("Shop view: centre %d,%d -> %d,%d (StandInLift %d)", x, y, x, y - g_cfg.shop_standin_lift, g_cfg.shop_standin_lift);
+    y -= g_cfg.shop_standin_lift;
+    memcpy(entry_rsp + 0x38, &y, 4);
 }
 
 static const BYTE *smm_shop_entry(int id, int *count);
@@ -1675,6 +1685,23 @@ static int cave_openshop(BYTE *c, const void *fn, const BYTE *orig6, const BYTE 
     return put_jmp(c, n, back);
 }
 
+/* Function entry with all four argument registers kept: fn(entry rsp, r8d), then the original
+   5 bytes, jump back. */
+static int cave_shopentry(BYTE *c, const void *fn, const BYTE *orig5, const BYTE *back)
+{
+    static const BYTE pre[] = { 0x51, 0x52, 0x41, 0x50, 0x41, 0x51,          /* push rcx, rdx, r8, r9 */
+                                0x48, 0x8D, 0x4C, 0x24, 0x20,                /* lea rcx,[rsp+20h] (entry rsp) */
+                                0x44, 0x89, 0xC2 };                          /* mov edx,r8d */
+    static const BYTE tail[] = { 0x48, 0x89, 0xEC, 0x5D,                     /* mov rsp,rbp; pop rbp */
+                                 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59 };       /* pop r9, r8, rdx, rcx */
+    int n = put_bytes(c, 0, pre, sizeof(pre));
+    n = put_bytes(c, n, CAVE_ALIGN_PRO, sizeof(CAVE_ALIGN_PRO));
+    n = put_call(c, n, fn);
+    n = put_bytes(c, n, tail, sizeof(tail));
+    n = put_bytes(c, n, orig5, 5);
+    return put_jmp(c, n, back);
+}
+
 /* Shop view: call fn(rsi = view, r15d = shopkeeper), then make the call the site held (to
    'target', no arguments) from here, and jump back past it. */
 static int cave_shopview(BYTE *c, const void *fn, const void *target, const BYTE *back)
@@ -1844,7 +1871,7 @@ static void smm_install_hooks(void)
     unsigned i;
     int lens[SMM_HOOK_COUNT];
     BYTE setup_orig[5];
-    int setup_len = 0, openshop_len = 0, shopview_len = 0;
+    int setup_len = 0, openshop_len = 0, shopview_len = 0, shopentry_len = 0;
     int dpad = (g_cfg.save_on && g_cfg.save_bind.trig != SMM_TRIG_START) ||
                (g_cfg.pause_on && g_cfg.pause_bind.trig != SMM_TRIG_START) ||
                (g_cfg.load_on && g_cfg.load_bind.trig != SMM_TRIG_START) ||
@@ -1958,6 +1985,22 @@ static void smm_install_hooks(void)
             g_shopview_hook = f + 0x1A;
         }
     }
+    /* ... and his height: the same setup's entry (0x196 bytes before the scale code), where its
+       screen-centre arguments can still be changed. Its prologue and both stack reads checked. */
+    g_shopentry_hook = 0;
+    if (g_shopview_hook) {
+        static const BYTE pro[30] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18,
+                                      0x48, 0x89, 0x7C, 0x24, 0x20, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x70 };
+        static const BYTE rd_y[7] = { 0x8B, 0x84, 0x24, 0xC0, 0x00, 0x00, 0x00 };   /* mov eax,[rsp+C0h] = entry [rsp+38h] */
+        static const BYTE rd_x[7] = { 0x8B, 0x84, 0x24, 0xB8, 0x00, 0x00, 0x00 };   /* mov eax,[rsp+B8h] = entry [rsp+30h] */
+        DWORD e = g_targets[T_SHOPVIEW].found - 0x196;
+        if (memcmp(g_base + e, pro, 30) != 0 || memcmp(g_base + e + 0x9C, rd_y, 7) != 0 || memcmp(g_base + e + 0xB8, rd_x, 7) != 0)
+            smm_log("Shop height: the shop's 3D view setup looks different; Sora stays where the shop puts him.");
+        else {
+            shopentry_len = cave_shopentry(block + 0x480, (const void *)(UINT_PTR)smm_on_shop_view_entry, pro, g_base + e + 5);
+            g_shopentry_hook = e;
+        }
+    }
     FlushInstructionCache(GetCurrentProcess(), block, 0x500);
 
     for (i = 0; i < SMM_HOOK_COUNT; i++) {
@@ -2001,6 +2044,11 @@ static void smm_install_hooks(void)
         if (smm_write_jump(g_base + g_shopview_hook, block + 0x400))
             smm_log("PATCHED: %-22s exe+%06X -> cave %p (%d bytes)", "shop view (Sora size)", g_shopview_hook, block + 0x400, shopview_len);
         else { smm_log("Shop size: could not write the shop view hook; Sora stays full size."); g_shopview_hook = 0; }
+    }
+    if (g_shopentry_hook) {
+        if (smm_write_jump(g_base + g_shopentry_hook, block + 0x480))
+            smm_log("PATCHED: %-22s exe+%06X -> cave %p (%d bytes)", "shop view (Sora height)", g_shopentry_hook, block + 0x480, shopentry_len);
+        else { smm_log("Shop height: could not write the shop view entry hook."); g_shopentry_hook = 0; }
     }
     /* The caves are written: execute-read from now on (no writable code left behind). */
     {

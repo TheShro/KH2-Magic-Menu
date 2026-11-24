@@ -363,15 +363,32 @@ int main(int argc, char **argv)
         g_cfg.shop_standin_size = 50; g_cfg.shop_standin_lift = 30;
         g_keeper_swapped = dummy;
         RUN_VIEW(0x20000236);
-        check(view[8] == 0.5f && view[9] == 0.5f && view[10] == 0.5f && view[11] == 1.0f && view[5] == -30.0f && view[4] == 0.0f &&
-              view[7] == 1.0f && view[1] == 0.0f, "remote shop, Sora standing in: shown at 50%, position Y raised by 30 (up is -Y)");
+        check(view[8] == 0.5f && view[9] == 0.5f && view[10] == 0.5f && view[11] == 1.0f && view[5] == 0.0f,
+              "remote shop, Sora standing in: shown at 50%");
         RUN_VIEW(0x20000487);
-        check(view[8] == 1.0f && view[5] == 0.0f, "a moogle in the view: left as it is");
+        check(view[8] == 1.0f, "a moogle in the view: left as it is");
         g_keeper_swapped = NULL;
         RUN_VIEW(0x20000236);
-        check(view[8] == 1.0f && view[5] == 0.0f, "no stand-in (not our shop): left as it is");
+        check(view[8] == 1.0f, "no stand-in (not our shop): left as it is");
 #undef RUN_VIEW
         g_img[0x166850] = keep1; g_img[0x2FECD5] = keep2;
+
+        /* height: the real entry hook at exe+2FEB20; a test "mov eax,[rsp+38h]; ret" after the
+           replaced instruction returns the screen-centre y the setup would use */
+        {
+            typedef int (*EntryFn)(void *, int, int, int, int, int, int);
+            static const BYTE ret_y[5] = { 0x8B, 0x44, 0x24, 0x38, 0xC3 };
+            BYTE keep[5];
+            EntryFn fn = (EntryFn)(g_img + 0x2FEB20);
+            check(g_shopentry_hook == 0x2FEB20 && g_img[0x2FEB20] == 0xE9, "shop view entry hook written at exe+2FEB20");
+            memcpy(keep, g_img + 0x2FEB25, 5); memcpy(g_img + 0x2FEB25, ret_y, 5);
+            g_keeper_swapped = dummy;
+            check(fn(NULL, 0, 0x20000236, 0, 0, 40, 60) == 60 - 30, "Sora standing in: screen centre y raised by StandInLift (60 -> 30)");
+            check(fn(NULL, 0, 0x20000487, 0, 0, 40, 60) == 60, "a moogle: screen centre left alone");
+            g_keeper_swapped = NULL;
+            check(fn(NULL, 0, 0x20000236, 0, 0, 40, 60) == 60, "not our shop: screen centre left alone");
+            memcpy(g_img + 0x2FEB25, keep, 5);
+        }
         memcpy(g_ini_text, ini, sizeof(ini));
         check(smm_load_settings(0) == 0 && g_cfg.shop_standin_size == 40 && g_cfg.shop_standin_lift == -25, "StandInSize = 40, StandInLift = -25 parsed");
         memcpy(g_ini_text, bad, sizeof(bad));
