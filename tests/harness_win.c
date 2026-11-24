@@ -392,7 +392,9 @@ int main(int argc, char **argv)
         memcpy(g_ini_text, ini, sizeof(ini));
         check(smm_load_settings(0) == 0 && g_cfg.shop_standin_size == 40 && g_cfg.shop_standin_lift == -25, "StandInSize = 40, StandInLift = -25 parsed");
         memcpy(g_ini_text, bad, sizeof(bad));
-        check(smm_load_settings(0) == 1 && g_cfg.shop_standin_size == 50, "StandInSize = 300: out of range, 50 used");
+        check(smm_load_settings(0) == 1 && g_cfg.shop_standin_size == 40, "StandInSize = 300: out of range, 40 used");
+        memcpy(g_ini_text, SMM_DEFAULT_INI, sizeof(SMM_DEFAULT_INI));
+        check(smm_load_settings(0) == 0 && g_cfg.shop_standin_size == 40 && g_cfg.shop_standin_lift == 120, "defaults: StandInSize 40, StandInLift 120");
     }
 
     printf(fails ? "%d FAILED\n" : "ALL PASS\n", fails);

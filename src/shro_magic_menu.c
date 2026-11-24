@@ -139,8 +139,8 @@ static const SmmConfig SMM_DEFAULTS = {
     -1,                                /* shop: the last moogle used (Last), else 0x13 */
     1,                                 /* only shops the story has already unlocked */
     0,                                 /* no saving during a battle */
-    50,                                /* Sora at 50% in the remote shop */
-    100                                /* ... raised by 100 screen units */
+    40,                                /* Sora at 40% in the remote shop (Adam's tuning) */
+    120                                /* ... raised by 120 screen units */
 };
 static SmmConfig g_cfg;
 
@@ -201,10 +201,10 @@ static const char SMM_DEFAULT_INI[] =
 "; 1 = only shops the story has already unlocked (you have met that shopkeeper).\r\n"
 "VisitedOnly = 1\r\n"
 "; Sora's size in the shop window, in percent (Sora is much bigger than a moogle): 10 to 100.\r\n"
-"StandInSize = 50\r\n"
+"StandInSize = 40\r\n"
 "; How far Sora is raised in the shop window, in the menu's screen units (the menu screen is\r\n"
 "; about 448 high; -300 to 300; negative = lower).\r\n"
-"StandInLift = 100\r\n"
+"StandInLift = 120\r\n"
 "\r\n"
 "[PartyMenu]\r\n"
 "; Start in battle opens the party menu instead of the battle pause.\r\n"
@@ -505,8 +505,8 @@ static int smm_load_settings(int quiet)
         }
     }
     if (g_cfg.shop_standin_size < 10 || g_cfg.shop_standin_size > 100) {
-        if (!quiet) smm_log("Settings: [RemoteShop] StandInSize = %d is not 10 to 100, 50 used", g_cfg.shop_standin_size);
-        g_cfg.shop_standin_size = 50;
+        if (!quiet) smm_log("Settings: [RemoteShop] StandInSize = %d is not 10 to 100, 40 used", g_cfg.shop_standin_size);
+        g_cfg.shop_standin_size = 40;
         problems++;
     }
     /* A keybind of None switches its feature off. */
