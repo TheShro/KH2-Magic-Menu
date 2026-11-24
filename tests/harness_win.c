@@ -189,9 +189,12 @@ int main(int argc, char **argv)
         check(!smm_do_shop("test"), "cutscene: refused");
         w32(SMM_CUT_FLAGS, 1);
 
-        /* shopkeeper model: loaded -> as is; not loaded -> Sora (0x236) until the shop closes */
+        /* shopkeeper model: Sora (0x236) always stands in until the shop closes; a model still in
+           the cache is no proof it is safe (1.9.1-test crash) */
         g_cfg.shop_id = 0x13; w32(0x716B50, 0xFFFFFFFF);
-        check(smm_do_shop("test") && r16(0x2DA0016) == 0x50F && !g_keeper_swapped, "moogle loaded here: shopkeeper kept");
+        check(smm_do_shop("test") && r16(0x2DA0016) == SMM_OBJ_PLAYER && g_keeper_swapped, "moogle listed as loaded: Sora still stands in");
+        w32(0x716B50, 0xFFFFFFFF); smm_on_frame();
+        check(r16(0x2DA0016) == 0x50F && !g_keeper_swapped, "shop closed: moogle put back (1)");
         w32(0x716B50, 0xFFFFFFFF);
         g_loaded_a = 0;                                                 /* the next room */
         check(smm_do_shop("test") && r16(0x2DA0016) == SMM_OBJ_PLAYER && g_keeper_swapped, "moogle not loaded: Sora stands in");

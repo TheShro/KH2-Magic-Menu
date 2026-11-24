@@ -1368,19 +1368,22 @@ static int smm_do_shop(const char *how)
         smm_log("%s: shop 0x%X is not unlocked in this save yet (flag %X), skipped (VisitedOnly = 1)", how, id, flag);
         return 0;
     }
-    /* The shopkeeper's model must already be loaded here, or the shop crashes. Otherwise Sora
-       (the player's own model, always loaded) stands in until the shop closes. */
+    /* The shop shows its shopkeeper's 3D model and cannot load one: a model that is not in memory
+       crashes it. The model cache is no proof (1.9.1-test: the moogle's model was still listed
+       one room after the moogle, then the shop crashed with a stack overflow), so Sora (the
+       player's own model, always loaded) always stands in for the remote shop, until it closes.
+       Talking to the shopkeeper still shows the shopkeeper (the game's own path). */
     smm_keeper_restore("new shop");
     keeper = (WORD)(e[6] | e[7] << 8);
-    if (!smm_model_loaded(keeper)) {
-        if (!smm_model_loaded(SMM_OBJ_PLAYER)) {
-            smm_log("%s: shopkeeper %X is not loaded here and neither is the player model; not opening (it would crash)", how, keeper);
-            return 0;
-        }
+    if (!smm_model_loaded(SMM_OBJ_PLAYER)) {
+        smm_log("%s: the player model is not loaded here; not opening (it would crash)", how);
+        return 0;
+    }
+    if (keeper != SMM_OBJ_PLAYER) {
         g_keeper_orig = keeper;
         g_keeper_swapped = e;
         e[6] = (BYTE)(SMM_OBJ_PLAYER & 0xFF); e[7] = (BYTE)(SMM_OBJ_PLAYER >> 8);
-        smm_log("%s: shopkeeper %X is not loaded here, Sora stands in", how, keeper);
+        smm_logv("%s: Sora stands in for shopkeeper %X", how, keeper);
     }
     smm_log("%s: opening shop 0x%X%s (world %02X room %02X)", how, id, g_cfg.shop_id < 0 ? " (last moogle)" : "",
             rd8(SMM_WORLD), rd8(SMM_WORLD + 1));
@@ -2039,8 +2042,8 @@ static LONG CALLBACK smm_on_exception(EXCEPTION_POINTERS *ep)
         smm_log("FAULT %08X at exe+%06X (if the game closed right after this, this is the CRASH)", code, (unsigned)(rip - base));
     else
         smm_log("FAULT %08X at %p, outside the game exe (if the game closed right after this, this is the CRASH)", code, (void *)rip);
-    /* Stack overflow: this runs on the little stack that is left; one line is all we risk. */
-    if (code == EXCEPTION_STACK_OVERFLOW) { if (g_log != INVALID_HANDLE_VALUE) FlushFileBuffers(g_log); return EXCEPTION_CONTINUE_SEARCH; }
+    /* Stack overflow included: Windows leaves this handler enough stack (1.9-test2 logged a full
+       report for one), and the call chain is what tells which object the game tried to use. */
     if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
         smm_log("  %s address %p", ep->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
                 (void *)ep->ExceptionRecord->ExceptionInformation[1]);
