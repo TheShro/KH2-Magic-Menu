@@ -139,7 +139,7 @@ static const SmmConfig SMM_DEFAULTS = {
     -1,                                /* shop: the last moogle used (Last), else 0x13 */
     1,                                 /* only shops the story has already unlocked */
     0,                                 /* no saving during a battle */
-    40,                                /* Sora at 40% in the remote shop (Adam's tuning) */
+    40,                                /* Sora at 40% in the remote shop (Shro's tuning) */
     120                                /* ... raised by 120 screen units */
 };
 static SmmConfig g_cfg;
